@@ -1,0 +1,88 @@
+// ================================================================
+// Texture Channel Packer Compute Shader
+// 
+// 文件名称: TextureChannelPackerCS.compute
+// 版本: 1.0
+// 
+// 描述: 用于纹理通道提取和重新打包的Compute Shader
+// 
+// 修改历史:
+// 2026-03-20 - 初始版本
+// ================================================================
+
+#pragma kernel ExtractChannel
+#pragma kernel PackChannels
+
+// 提取通道相关参数
+Texture2D<float4> SourceTexture;
+RWTexture2D<float4> ExtractedResult;
+int SourceChannelIndex; // 0:R, 1:G, 2:B, 3:A
+int OutputWidth;
+int OutputHeight;
+
+// 定义双线性采样
+SamplerState LinearClampSampler;
+
+[numthreads(8, 8, 1)]
+void ExtractChannel (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)OutputWidth || id.y >= (uint)OutputHeight) return;
+
+    // 计算归一化UV
+    float2 uv = float2((id.x + 0.5) / (float)OutputWidth, (id.y + 0.5) / (float)OutputHeight);
+    
+    // 从源纹理采样
+    float4 srcColor = SourceTexture.SampleLevel(LinearClampSampler, uv, 0);
+    
+    float val = 0;
+    if(SourceChannelIndex == 0) val = srcColor.r;
+    else if(SourceChannelIndex == 1) val = srcColor.g;
+    else if(SourceChannelIndex == 2) val = srcColor.b;
+    else if(SourceChannelIndex == 3) val = srcColor.a;
+
+    // 输出为灰度图，RGB相同，A为1
+    ExtractedResult[id.xy] = float4(val, val, val, 1.0);
+}
+
+// 打包通道相关参数
+Texture2D<float4> TexR;
+Texture2D<float4> TexG;
+Texture2D<float4> TexB;
+Texture2D<float4> TexA;
+RWTexture2D<float4> PackedResult;
+
+// 0:R, 1:G, 2:B, 3:A, 4:Black, 5:White
+int SourceChannelForR;
+int SourceChannelForG;
+int SourceChannelForB;
+int SourceChannelForA;
+
+float GetChannelValue(Texture2D<float4> tex, float2 uv, int channelIndex)
+{
+    if(channelIndex == 4) return 0.0;
+    if(channelIndex == 5) return 1.0;
+    
+    float4 col = tex.SampleLevel(LinearClampSampler, uv, 0);
+    
+    if(channelIndex == 0) return col.r;
+    if(channelIndex == 1) return col.g;
+    if(channelIndex == 2) return col.b;
+    if(channelIndex == 3) return col.a;
+    
+    return 0.0;
+}
+
+[numthreads(8, 8, 1)]
+void PackChannels (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)OutputWidth || id.y >= (uint)OutputHeight) return;
+
+    float2 uv = float2((id.x + 0.5) / (float)OutputWidth, (id.y + 0.5) / (float)OutputHeight);
+
+    float r = GetChannelValue(TexR, uv, SourceChannelForR);
+    float g = GetChannelValue(TexG, uv, SourceChannelForG);
+    float b = GetChannelValue(TexB, uv, SourceChannelForB);
+    float a = GetChannelValue(TexA, uv, SourceChannelForA);
+
+    PackedResult[id.xy] = float4(r, g, b, a);
+}

@@ -1,0 +1,134 @@
+#pragma kernel InitSeeds
+#pragma kernel JumpFlood
+#pragma kernel ComposeSdf
+
+Texture2D<float4> SourceTexture;
+RWTexture2D<float4> SeedInsideTex;
+RWTexture2D<float4> SeedOutsideTex;
+
+Texture2D<float4> SourceSeedTex;
+RWTexture2D<float4> DestSeedTex;
+
+Texture2D<float4> FinalSeedInsideTex;
+Texture2D<float4> FinalSeedOutsideTex;
+RWTexture2D<float4> SdfOutputTex;
+
+int TextureWidth;
+int TextureHeight;
+int Threshold;
+int UseGreenChannel;
+int JumpStep;
+float SdfSpreadPixels;
+int Invert;
+
+static const float InvalidSeed = -65535.0;
+
+bool IsInside(int2 uv)
+{
+    float4 c = SourceTexture.Load(int3(uv, 0));
+    float v = UseGreenChannel == 1 ? c.g : (c.r + c.g + c.b) / 3.0;
+    return v * 255.0 > (float)Threshold;
+}
+
+float4 EncodeSeed(bool valid, int2 pos)
+{
+    if (!valid)
+    {
+        return float4(InvalidSeed, InvalidSeed, 0.0, 0.0);
+    }
+    return float4((float)pos.x, (float)pos.y, 1.0, 0.0);
+}
+
+bool IsValidSeed(float4 seed)
+{
+    return seed.z > 0.5;
+}
+
+float SeedDistSq(float4 seed, int2 p)
+{
+    float2 d = seed.xy - float2((float)p.x, (float)p.y);
+    return dot(d, d);
+}
+
+[numthreads(8, 8, 1)]
+void InitSeeds(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2((int)id.x, (int)id.y);
+    if (p.x >= TextureWidth || p.y >= TextureHeight)
+    {
+        return;
+    }
+
+    bool inside = IsInside(p);
+
+    SeedInsideTex[p] = EncodeSeed(inside, p);
+    SeedOutsideTex[p] = EncodeSeed(!inside, p);
+}
+
+[numthreads(8, 8, 1)]
+void JumpFlood(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2((int)id.x, (int)id.y);
+    if (p.x >= TextureWidth || p.y >= TextureHeight)
+    {
+        return;
+    }
+
+    float4 bestSeed = SourceSeedTex.Load(int3(p, 0));
+    float bestDist = IsValidSeed(bestSeed) ? SeedDistSq(bestSeed, p) : 3.402823466e+38;
+
+    [unroll]
+    for (int oy = -1; oy <= 1; oy++)
+    {
+        [unroll]
+        for (int ox = -1; ox <= 1; ox++)
+        {
+            int2 np = p + int2(ox * JumpStep, oy * JumpStep);
+            if (np.x < 0 || np.x >= TextureWidth || np.y < 0 || np.y >= TextureHeight)
+            {
+                continue;
+            }
+
+            float4 seed = SourceSeedTex.Load(int3(np, 0));
+            if (!IsValidSeed(seed))
+            {
+                continue;
+            }
+
+            float dist = SeedDistSq(seed, p);
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                bestSeed = seed;
+            }
+        }
+    }
+
+    DestSeedTex[p] = bestSeed;
+}
+
+[numthreads(8, 8, 1)]
+void ComposeSdf(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2((int)id.x, (int)id.y);
+    if (p.x >= TextureWidth || p.y >= TextureHeight)
+    {
+        return;
+    }
+
+    float4 inSeed = FinalSeedInsideTex.Load(int3(p, 0));
+    float4 outSeed = FinalSeedOutsideTex.Load(int3(p, 0));
+
+    float dIn = IsValidSeed(inSeed) ? sqrt(SeedDistSq(inSeed, p)) : SdfSpreadPixels;
+    float dOut = IsValidSeed(outSeed) ? sqrt(SeedDistSq(outSeed, p)) : SdfSpreadPixels;
+    float signedDist = dOut - dIn;
+
+    float normalized = 0.5 + signedDist / max(1.0, SdfSpreadPixels) * 0.5;
+    normalized = saturate(normalized);
+    if (Invert == 1)
+    {
+        normalized = 1.0 - normalized;
+    }
+
+    SdfOutputTex[p] = float4(normalized, normalized, normalized, 1.0);
+}
