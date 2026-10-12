@@ -1,191 +1,507 @@
 // ================================================================
-// 功能名称: 截图工具
-// 
+// 截图与录屏工具
+//
 // 文件名称: ScreenshotToolWindow.cs
-// 版本: 1.2
-// 
-// 描述:
-// Editor 截图工具窗口，支持：
-// 1) Game 视图截图（ScreenCapture）；
-// 2) 指定相机离屏截图（Camera.Render + ReadPixels）；
-// 3) Play 模式视频录制与 mp4 编码输出。
-// 
-// 使用方法:
-// 1) 菜单 Tools/Azumi/截图工具 打开窗口；
-// 2) 在“Game视图截图”或“相机截图”区域配置参数后执行截图；
-// 3) 在 Play 模式下可使用 F9 或面板按钮录制视频并输出 mp4 文件。
-// 
+// 版本: 1.8
+//
+// 描述: 提供 Game 视图截图、指定相机截图，以及基于 ffmpeg 的
+// 指定相机录屏能力。录屏会将目标 Camera 渲染到独立的 RenderTexture，
+// 再通过 ffmpeg 的 stdin 直接编码为 mp4，不依赖 GameView 窗口内容。
+//
 // 修改历史:
-// 2026-04-29 - 1.0 增加 CameraView 预设遍历多角度截图功能
-// 2026-05-19 - 1.1 去除对 CameraView 脚本类型的直接依赖，改为通用组件预设读取
-// 2026-05-19 - 1.2 移除与 CameraView 配套的多角度预设截图功能，仅保留通用截图与录屏
+// 2026-06-26 - 补充脚本头部信息
+// 2026-06-26 - 新增 ffmpeg 录屏、延迟录制、定时录制与停止录制功能
+// 2026-06-26 - 修复 ffmpeg 浏览按钮目录打开异常，并新增录屏输出分辨率设置
+// 2026-06-26 - 将录屏源改为指定 Camera 直接输出，移除对 GameView 的依赖
+// 2026-07-03 - 新增录制期相机轨迹采样、轨迹预设保存，以及轨迹回放录屏功能
+// 2026-07-03 - 将轨迹回放录制改为离线逐帧采集，解决实时录制掉帧导致的画面卡顿
+// 2026-07-03 - 将轨迹采样从视频抓帧中解耦，并在保存前重采样为稳定时间步
+// 2026-07-22 - 为实时录制增加帧缓冲复用与背压控制，降低 GC 和队列堆积导致的卡顿
+// 2026-07-30 - 在工具窗口中显示当前录制时长，便于观察录制进度
 // ================================================================
-
 using System;
-using System.Buffers;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
-using System.Text;
 using System.Threading;
+using Unity.Collections;
 using UnityEditor;
-using UnityEditor.ShortcutManagement;
+using UnityEditor.PackageManager.Requests;
 using UnityEngine;
 using UnityEngine.Rendering;
-using UnityEngine.Rendering.Universal;
 using Debug = UnityEngine.Debug;
 
 public class ScreenshotToolWindow : EditorWindow
 {
     private const string PrefKeyPrefix = "Azumi_ScreenshotTool_";
     private const string DefaultFolderName = "Screenshots";
-    private const int DefaultVideoFps = 30;
-    private const float DefaultVideoDurationSeconds = 5f;
-    private static readonly int[] MsaaSampleOptions = { 1, 2, 4, 8 };
-    private static readonly string[] MsaaSampleOptionLabels = { "1x", "2x", "4x", "8x" };
-    private static readonly string[] FfmpegPresetOptions = { "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow" };
+    private const int RecordFrameRate = 60;
+    private const int RecordQualityCrf = 23;
+    private const string DefaultFilePrefix = "Screenshot";
+    private const int MinTrajectoryKeyframeCount = 2;
+    private const int TrajectorySampleRate = 120;
+    private const double RecordFrameInterval = 1d / RecordFrameRate;
+    private const int MaxPendingGpuReadbackCount = 2;
+    private const int MaxQueuedRecordFrameCount = 2;
 
     private string m_OutputFolderName = DefaultFolderName;
-    private string m_FilePrefix = "Screenshot";
+    private string m_FilePrefix = DefaultFilePrefix;
     private int m_Width = 1920;
     private int m_Height = 1080;
     private int m_SuperSize = 1;
     private Camera m_TargetCamera;
     private bool m_RevealInExplorer = true;
-
-    private int m_VideoFps = DefaultVideoFps;
-    private bool m_VideoFixedDurationEnabled = true;
-    private float m_VideoDurationSeconds = DefaultVideoDurationSeconds;
-    private string m_FfmpegPath = string.Empty;
-    private bool m_KeepVideoFrames;
-    private bool m_UseRecordingMsaa = true;
-    private int m_RecordingMsaaSamples = 4;
-    private bool m_OverrideUrpQuality;
-    private float m_RecordingUrpRenderScale = 1.25f;
-    private int m_RecordingUrpMsaaSamples = 4;
-    private bool m_UseHighQualityEncoding = true;
-    private int m_VideoCrf = 16;
-    private string m_FfmpegPreset = "slow";
-    private int m_MaxPendingReadbackFrames = 2;
-
-    private bool m_IsRecording;
-    private string m_RecordingFrameDirectory = string.Empty;
+    private string m_FfmpegExePath = string.Empty;
+    private float m_RecordDurationSeconds = 10f;
+    private float m_RecordDelaySeconds = 0f;
+    private int m_RecordWidth = 1920;
+    private int m_RecordHeight = 1080;
+    private bool m_RecordCameraTrajectory = true;
+    private Process m_RecordProcess;
+    private bool m_IsRecordScheduled;
+    private bool m_IsStoppingRecording;
+    private bool m_IsRecordInputClosing;
+    private double m_RecordStartTime;
+    private double m_RecordEndTime;
+    private double m_RecordNextFrameTime;
+    private string m_PendingRecordOutputPath = string.Empty;
     private string m_RecordingOutputPath = string.Empty;
-    private string m_RecordingRawVideoPath = string.Empty;
-    private int m_RecordingFrameIndex;
-    private int m_WrittenRawFrameCount;
-    private int m_RecordingWidth;
-    private int m_RecordingHeight;
-    private int m_PreparedRecordingWidth;
-    private int m_PreparedRecordingHeight;
-    private int m_PreparedRecordingMsaaSamples;
-    private double m_RecordingStartTime;
-    private double m_RecordingStopTime;
-    private double m_NextFrameTime;
+    private string m_LastRecordLogLine = string.Empty;
+    private string m_RecordPipelineError = string.Empty;
     private Camera m_RecordingCamera;
-    private RenderTexture m_RecordingRenderTexture;
-    private RenderTexture m_RecordingReadbackTexture;
-    private bool m_RecordingReadbackPrewarmed;
-    private ConcurrentQueue<RawVideoFrame> m_RawFrameQueue;
-    private Thread m_RawWriterThread;
-    private volatile bool m_RawWriterShouldStop;
-    private volatile bool m_RawWriterFailed;
-    private string m_RawWriterError = string.Empty;
+    private RenderTexture m_RecordRenderTexture;
+    private Thread m_RecordWriterThread;
+    private readonly AutoResetEvent m_RecordFrameEvent = new AutoResetEvent(false);
+    private readonly Queue<NativeArray<byte>> m_RecordFrameQueue = new Queue<NativeArray<byte>>();
+    private readonly object m_RecordFrameQueueLock = new object();
+    private volatile bool m_RecordWriterRunning;
+    private volatile bool m_RecordWriterExited = true;
+    private volatile bool m_IsWritingRecordFrame;
     private int m_PendingReadbackCount;
-    private int m_DroppedRecordingFrameCount;
-    private bool m_IsEncodingVideo;
-    private Process m_EncodingProcess;
-    private string m_EncodingOutputPath = string.Empty;
-    private UniversalRenderPipelineAsset m_OverriddenUrpAsset;
-    private float m_OriginalUrpRenderScale;
-    private int m_OriginalUrpMsaaSamples;
-    private bool m_HasUrpQualityOverride;
-    private Camera m_OverriddenCamera;
-    private bool m_OriginalCameraAllowMsaa;
-    private bool m_HasCameraQualityOverride;
+    private int m_RecordFrameByteSize;
+    private int m_LastRenderedFrameCount;
+    private float m_ActiveRecordDurationSeconds;
+    private double m_RecordCaptureStartTime;
+    private double m_TrajectoryNextSampleTime;
+    private bool m_IsOfflinePlaybackRecording;
+    private int m_OfflinePlaybackFrameIndex;
+    private int m_OfflinePlaybackFrameCount;
+    private CameraTrajectoryPreset m_SelectedTrajectoryPreset;
+    private CameraTrajectoryPreset m_PendingTrajectoryPreset;
+    private CameraTrajectoryPreset m_ActiveTrajectoryPreset;
+    private readonly List<CameraTrajectoryKeyframe> m_RawRecordedTrajectoryKeyframes = new List<CameraTrajectoryKeyframe>();
+    private readonly List<CameraTrajectoryKeyframe> m_LastRecordedTrajectoryKeyframes = new List<CameraTrajectoryKeyframe>();
+    private string m_LastRecordedTrajectoryCameraName = string.Empty;
+    private float m_LastRecordedTrajectoryDuration;
+    private bool m_IsTrajectoryPlaybackActive;
+    private Texture2D m_OfflinePlaybackReadTexture;
+    private Vector3 m_PlaybackRestorePosition;
+    private Quaternion m_PlaybackRestoreRotation = Quaternion.identity;
+    private float m_PlaybackRestoreFieldOfView = 60f;
+    private float m_PlaybackRestoreOrthographicSize = 5f;
+    private bool m_PlaybackRestoreOrthographic;
 
-    private struct RawVideoFrame
-    {
-        public int Index;
-        public byte[] Data;
-        public int Length;
-    }
+    // ----------------------------------------------------------------
+    // 机位平滑运动系统（与轨迹回放并存，UI 互斥切换）
+    // ----------------------------------------------------------------
+    private enum CameraMovementMode { Trajectory, Rig }
+    private CameraMovementMode m_MovementMode = CameraMovementMode.Trajectory;
+    private const int DefaultRigWaypointCount = 5;
+    private List<Transform> m_RigWaypoints = new List<Transform>(new Transform[DefaultRigWaypointCount]);
+    private Transform m_RigLookAtTarget;
+    private float m_RigSmoothTime = 2f;
+    private float m_RigMaxSpeed = float.PositiveInfinity;
+    private float m_RigArrivalThreshold = 0.01f;
+    private bool m_IsRigPreviewing;
+    private double m_LastRigUpdateTime;
+    private readonly CameraRigDriver m_RigDriver = new CameraRigDriver();
 
     [MenuItem("Tools/Azumi/截图工具")]
     public static void ShowWindow()
     {
         ScreenshotToolWindow window = GetWindow<ScreenshotToolWindow>("截图工具");
-        window.minSize = new Vector2(420f, 260f);
+        window.minSize = new Vector2(460f, 600f);
         window.Show();
-    }
-
-    [Shortcut("Azumi Screenshot Tool/Toggle Video Recording", KeyCode.F9)]
-    private static void ToggleVideoRecordingShortcut()
-    {
-        ScreenshotToolWindow window = GetWindow<ScreenshotToolWindow>("截图工具");
-        window.minSize = new Vector2(420f, 260f);
-        window.ToggleRecording();
     }
 
     private void OnEnable()
     {
         LoadPrefs();
+        EditorApplication.update -= OnEditorUpdate;
         EditorApplication.update += OnEditorUpdate;
-        EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
     }
 
     private void OnDisable()
     {
-        if (m_IsRecording)
-        {
-            StopRecording(true);
-        }
-
         EditorApplication.update -= OnEditorUpdate;
-        EditorApplication.playModeStateChanged -= OnPlayModeStateChanged;
-        RestoreCameraQualityOverrides();
-        RestoreRecordingQualityOverrides();
-        ReleasePreparedRecordingTexture();
         SavePrefs();
+        CancelScheduledRecording();
+        DisposeRecordingProcess(true);
     }
 
     private void OnGUI()
     {
+        DrawSaveSettingsSection();
+
+        EditorGUILayout.Space(8f);
+        DrawGameScreenshotSection();
+
+        EditorGUILayout.Space(8f);
+        DrawCameraScreenshotSection();
+
+        EditorGUILayout.Space(8f);
+        DrawRecordSection();
+    }
+
+    private void DrawSaveSettingsSection()
+    {
         EditorGUILayout.LabelField("保存设置", EditorStyles.boldLabel);
         m_OutputFolderName = EditorGUILayout.TextField("输出目录(项目根目录下)", m_OutputFolderName);
         m_FilePrefix = EditorGUILayout.TextField("文件名前缀", m_FilePrefix);
-        m_RevealInExplorer = EditorGUILayout.Toggle("截图后打开目录", m_RevealInExplorer);
+        m_RevealInExplorer = EditorGUILayout.Toggle("完成后打开目录", m_RevealInExplorer);
+    }
 
-        EditorGUILayout.Space(8f);
+    private void DrawGameScreenshotSection()
+    {
         EditorGUILayout.LabelField("Game视图截图", EditorStyles.boldLabel);
         m_SuperSize = EditorGUILayout.IntSlider("放大倍数", m_SuperSize, 1, 4);
         if (GUILayout.Button("截取 Game 视图", GUILayout.Height(26f)))
         {
             CaptureGameView();
         }
+    }
 
-        EditorGUILayout.Space(8f);
+    private void DrawCameraScreenshotSection()
+    {
         EditorGUILayout.LabelField("相机截图", EditorStyles.boldLabel);
         m_TargetCamera = (Camera)EditorGUILayout.ObjectField("目标相机", m_TargetCamera, typeof(Camera), true);
-        m_Width = EditorGUILayout.IntField("宽度", m_Width);
-        m_Height = EditorGUILayout.IntField("高度", m_Height);
-
-        m_Width = Mathf.Max(1, m_Width);
-        m_Height = Mathf.Max(1, m_Height);
+        m_Width = Mathf.Max(1, EditorGUILayout.IntField("宽度", m_Width));
+        m_Height = Mathf.Max(1, EditorGUILayout.IntField("高度", m_Height));
 
         if (GUILayout.Button("截取目标相机", GUILayout.Height(26f)))
         {
             CaptureCamera();
         }
+    }
 
-        DrawVideoRecordingSettings();
+    private void DrawRecordSection()
+    {
+        EditorGUILayout.LabelField("相机录屏", EditorStyles.boldLabel);
+        EditorGUILayout.HelpBox(
+            "录屏将直接采集上方“目标相机”的渲染结果；若未指定，则回退到 Main Camera。录制尺寸为独立输出分辨率，不再依赖 GameView 窗口，也不会再因为窗口比例导致画面变形。",
+            MessageType.Info);
+
+        DrawFfmpegPathField();
+
+        EditorGUI.BeginDisabledGroup(IsRecordingActive() || m_IsRecordScheduled);
+        m_RecordDurationSeconds = Mathf.Max(1f, EditorGUILayout.FloatField("录制时长(秒)", m_RecordDurationSeconds));
+        m_RecordDelaySeconds = Mathf.Max(0f, EditorGUILayout.FloatField("延迟录制(秒)", m_RecordDelaySeconds));
+        m_RecordWidth = EnsureEvenPositiveSize(EditorGUILayout.IntField("录制宽度", m_RecordWidth));
+        m_RecordHeight = EnsureEvenPositiveSize(EditorGUILayout.IntField("录制高度", m_RecordHeight));
+        EditorGUILayout.IntField("录制帧率", RecordFrameRate);
+        m_RecordCameraTrajectory = EditorGUILayout.Toggle("录制时记录轨迹", m_RecordCameraTrajectory);
+        EditorGUI.EndDisabledGroup();
+
+        DrawMovementModeSection();
+        DrawTrajectoryPresetSection();
+        DrawRigConfigSection();
+        DrawRecordStatus();
+        DrawRecordButtons();
+        DrawLastRecordedTrajectorySection();
+    }
+
+    private void DrawFfmpegPathField()
+    {
+        EditorGUILayout.BeginHorizontal();
+        m_FfmpegExePath = EditorGUILayout.TextField("ffmpeg.exe 路径", m_FfmpegExePath);
+        if (GUILayout.Button("浏览", GUILayout.Width(68f)))
+        {
+            string selectedPath = EditorUtility.OpenFilePanel("选择 ffmpeg.exe", GetFfmpegBrowseDirectory(), "exe");
+            if (!string.IsNullOrWhiteSpace(selectedPath))
+            {
+                m_FfmpegExePath = selectedPath;
+                GUI.FocusControl(null);
+            }
+        }
+
+        EditorGUILayout.EndHorizontal();
+    }
+
+    private void DrawRecordStatus()
+    {
+        Camera previewCamera = ResolveTargetCamera(false);
+        string cameraName = previewCamera != null ? previewCamera.name : "未指定";
+        string scheduledModeText = m_MovementMode == CameraMovementMode.Rig
+            ? "机位平滑录制"
+            : (m_PendingTrajectoryPreset != null ? $"轨迹回放录制: {m_PendingTrajectoryPreset.name}" : "直接相机录制");
+        string activeModeText = m_MovementMode == CameraMovementMode.Rig
+            ? "机位平滑录制"
+            : (m_ActiveTrajectoryPreset != null ? $"轨迹回放录制: {m_ActiveTrajectoryPreset.name}" : "直接相机录制");
+
+
+        if (m_IsRecordScheduled)
+        {
+            float remainSeconds = Mathf.Max(0f, (float)(m_RecordStartTime - EditorApplication.timeSinceStartup));
+            EditorGUILayout.HelpBox(
+                $"录屏已排队，将在 {remainSeconds:F1} 秒后开始。模式: {scheduledModeText}，录制相机: {cameraName}，输出文件: {Path.GetFileName(m_PendingRecordOutputPath)}",
+                MessageType.Warning);
+            return;
+        }
+
+        if (IsRecordingActive())
+        {
+            float elapsedSeconds = GetDisplayedRecordElapsedSeconds();
+            EditorGUILayout.HelpBox(
+                $"正在录制相机: {cameraName}，模式: {activeModeText}，当前录制时长: {elapsedSeconds:F1} / {m_ActiveRecordDurationSeconds:F1} 秒，输出文件: {Path.GetFileName(m_RecordingOutputPath)}",
+                MessageType.Warning);
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(m_RecordingOutputPath) && File.Exists(m_RecordingOutputPath))
+        {
+            EditorGUILayout.HelpBox(
+                $"最近一次录制文件: {Path.GetFileName(m_RecordingOutputPath)}",
+                MessageType.None);
+        }
+    }
+
+    private void DrawTrajectoryPresetSection()
+    {
+        EditorGUILayout.Space(4f);
+        EditorGUILayout.LabelField("轨迹预设", EditorStyles.boldLabel);
+        EditorGUILayout.HelpBox(
+            "开始录制时默认会按当前录制帧率采样目标相机轨迹。录制结束后可以将最近一次轨迹保存为预设，并支持一键按预设回放运镜同时再次录制输出视频。轨迹回放录制会使用离线逐帧采集，录制过程可能比实时慢，但成片更稳定。",
+            MessageType.None);
+
+        EditorGUI.BeginDisabledGroup(IsRecordingActive() || m_IsRecordScheduled);
+        m_SelectedTrajectoryPreset = (CameraTrajectoryPreset)EditorGUILayout.ObjectField("回放预设", m_SelectedTrajectoryPreset, typeof(CameraTrajectoryPreset), false);
+        EditorGUI.EndDisabledGroup();
+    }
+
+    private void DrawMovementModeSection()
+    {
+        EditorGUILayout.Space(4f);
+        EditorGUILayout.LabelField("运动模式", EditorStyles.boldLabel);
+        CameraMovementMode previousMode = m_MovementMode;
+        EditorGUI.BeginDisabledGroup(IsRecordingActive() || m_IsRecordScheduled || m_IsRigPreviewing);
+        m_MovementMode = (CameraMovementMode)EditorGUILayout.EnumPopup("当前模式", m_MovementMode);
+        EditorGUI.EndDisabledGroup();
+        if (previousMode != m_MovementMode && m_IsRigPreviewing)
+        {
+            StopRigPreview();
+        }
+    }
+
+    private void DrawRigConfigSection()
+    {
+        if (m_MovementMode != CameraMovementMode.Rig)
+        {
+            return;
+        }
+
+        EditorGUILayout.Space(4f);
+        EditorGUILayout.LabelField("机位配置", EditorStyles.boldLabel);
+
+        // 机位列表
+        for (int i = 0; i < m_RigWaypoints.Count; i++)
+        {
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField($"机位 {i + 1}", GUILayout.Width(60f));
+            Transform newWaypoint = (Transform)EditorGUILayout.ObjectField(m_RigWaypoints[i], typeof(Transform), true);
+            if (newWaypoint != m_RigWaypoints[i])
+            {
+                m_RigWaypoints[i] = newWaypoint;
+            }
+            if (m_RigWaypoints[i] == null)
+            {
+                EditorGUILayout.LabelField("失效", EditorStyles.miniLabel, GUILayout.Width(30f));
+            }
+            EditorGUILayout.EndHorizontal();
+        }
+
+        // 添加/移除机位按钮
+        EditorGUILayout.BeginHorizontal();
+        if (GUILayout.Button("+ 添加机位", GUILayout.Width(100f)))
+        {
+            m_RigWaypoints.Add(null);
+        }
+        EditorGUI.BeginDisabledGroup(m_RigWaypoints.Count <= 2);
+        if (GUILayout.Button("- 移除末尾", GUILayout.Width(100f)))
+        {
+            m_RigWaypoints.RemoveAt(m_RigWaypoints.Count - 1);
+        }
+        EditorGUI.EndDisabledGroup();
+        EditorGUILayout.EndHorizontal();
+
+        // LookAt 目标
+        m_RigLookAtTarget = (Transform)EditorGUILayout.ObjectField("LookAt 目标", m_RigLookAtTarget, typeof(Transform), true);
+
+        // 参数
+        EditorGUI.BeginDisabledGroup(IsRecordingActive() || m_IsRecordScheduled || m_IsRigPreviewing);
+        m_RigSmoothTime = Mathf.Max(0.01f, EditorGUILayout.FloatField("平滑时间", m_RigSmoothTime));
+        m_RigMaxSpeed = EditorGUILayout.FloatField("最大速度(∞=无上限)", m_RigMaxSpeed);
+        EditorGUI.EndDisabledGroup();
+
+        EditorGUILayout.HelpBox(
+            $"运动路径: 机位1→2→...→{m_RigWaypoints.Count}→1 结束。录制时长字段作为最大安全上限，机位回到起点会提前停止。",
+            MessageType.None);
+    }
+
+    private bool TryValidateRigConfig(out string error)
+    {
+        error = null;
+        int validCount = 0;
+        foreach (Transform wp in m_RigWaypoints)
+        {
+            if (wp != null) validCount++;
+        }
+        if (validCount < 2) { error = "至少需要 2 个有效机位"; return false; }
+        if (m_RigLookAtTarget == null) { error = "LookAt 目标未设置"; return false; }
+        if (m_RigSmoothTime <= 0f) { error = "平滑时间必须 > 0"; return false; }
+        return true;
+    }
+    private void StartRigPreview()
+    {
+        if (!TryValidateRigConfig(out string error))
+        {
+            EditorUtility.DisplayDialog("机位预览", error, "确定");
+            return;
+        }
+
+        Camera previewCamera = ResolveTargetCamera(true);
+        if (previewCamera == null)
+        {
+            return;
+        }
+
+        // 备份相机姿态
+        m_PlaybackRestorePosition = previewCamera.transform.position;
+        m_PlaybackRestoreRotation = previewCamera.transform.rotation;
+        m_PlaybackRestoreFieldOfView = previewCamera.fieldOfView;
+        m_PlaybackRestoreOrthographic = previewCamera.orthographic;
+        m_PlaybackRestoreOrthographicSize = previewCamera.orthographicSize;
+
+        m_RecordingCamera = previewCamera;
+        m_RigDriver.Begin(previewCamera, m_RigWaypoints, m_RigLookAtTarget, m_RigSmoothTime, m_RigMaxSpeed);
+        m_LastRigUpdateTime = EditorApplication.timeSinceStartup;
+        m_IsRigPreviewing = true;
+    }
+
+    private void StopRigPreview()
+    {
+        if (!m_IsRigPreviewing)
+        {
+            return;
+        }
+
+        m_IsRigPreviewing = false;
+        m_RigDriver.Reset();
+
+        // 恢复相机姿态
+        if (m_RecordingCamera != null)
+        {
+            m_RecordingCamera.transform.SetPositionAndRotation(m_PlaybackRestorePosition, m_PlaybackRestoreRotation);
+            m_RecordingCamera.orthographic = m_PlaybackRestoreOrthographic;
+            if (m_PlaybackRestoreOrthographic)
+            {
+                m_RecordingCamera.orthographicSize = m_PlaybackRestoreOrthographicSize;
+            }
+            else
+            {
+                m_RecordingCamera.fieldOfView = m_PlaybackRestoreFieldOfView;
+            }
+            m_RecordingCamera = null;
+        }
+    }
+
+    private void DrawRecordButtons()
+    {
+        EditorGUILayout.BeginHorizontal();
+        EditorGUI.BeginDisabledGroup(IsRecordingActive() || m_IsRecordScheduled || m_IsRigPreviewing);
+        if (GUILayout.Button("开始录制相机", GUILayout.Height(28f)))
+        {
+            ScheduleRecording(null);
+        }
+
+        EditorGUI.EndDisabledGroup();
+
+        // 回放轨迹按钮在机位模式下灰显
+        EditorGUI.BeginDisabledGroup(IsRecordingActive() || m_IsRecordScheduled || m_IsRigPreviewing || m_MovementMode == CameraMovementMode.Rig || !HasValidTrajectoryPreset(m_SelectedTrajectoryPreset));
+        if (GUILayout.Button("回放轨迹并录制", GUILayout.Height(28f)))
+        {
+            ScheduleRecording(m_SelectedTrajectoryPreset);
+        }
+
+        EditorGUI.EndDisabledGroup();
+        EditorGUILayout.EndHorizontal();
+
+
+
+        EditorGUILayout.BeginHorizontal();
+        EditorGUI.BeginDisabledGroup(!m_IsRecordScheduled);
+        if (GUILayout.Button("取消延迟录制", GUILayout.Height(28f)))
+        {
+            CancelScheduledRecording();
+        }
+
+        EditorGUI.EndDisabledGroup();
+        EditorGUI.BeginDisabledGroup(!IsRecordingActive());
+        if (GUILayout.Button("停止录制", GUILayout.Height(28f)))
+        {
+            StopRecording();
+        }
+
+        EditorGUI.EndDisabledGroup();
+        EditorGUILayout.EndHorizontal();
+
+        // 机位模式预览按钮（独立于录制）
+        if (m_MovementMode == CameraMovementMode.Rig)
+        {
+            EditorGUILayout.Space(4f);
+            EditorGUI.BeginDisabledGroup(IsRecordingActive() || m_IsRecordScheduled || Application.isPlaying);
+            if (!m_IsRigPreviewing)
+            {
+                if (GUILayout.Button("预览机位运动", GUILayout.Height(26f)))
+                {
+                    StartRigPreview();
+                }
+            }
+            else
+            {
+                if (GUILayout.Button("停止预览", GUILayout.Height(26f)))
+                {
+                    StopRigPreview();
+                }
+            }
+            EditorGUI.EndDisabledGroup();
+        }
+    }
+
+    private void DrawLastRecordedTrajectorySection()
+    {
+        if (!HasRecordableTrajectoryCache())
+        {
+            return;
+        }
+
+        EditorGUILayout.Space(4f);
+        EditorGUILayout.HelpBox(
+            $"最近一次轨迹缓存: 相机 {m_LastRecordedTrajectoryCameraName}，时长 {m_LastRecordedTrajectoryDuration:F2} 秒，关键帧数 {m_LastRecordedTrajectoryKeyframes.Count}。",
+            MessageType.Info);
+
+        EditorGUI.BeginDisabledGroup(IsRecordingActive() || m_IsRecordScheduled);
+        if (GUILayout.Button("保存最近录制轨迹预设", GUILayout.Height(26f)))
+        {
+            SaveLastRecordedTrajectoryPreset();
+        }
+
+        EditorGUI.EndDisabledGroup();
     }
 
     private void CaptureGameView()
     {
-        string filePath = CreateScreenshotPath();
+        string filePath = CreateOutputPath("png");
         ScreenCapture.CaptureScreenshot(filePath, m_SuperSize);
         EditorApplication.delayCall += () =>
         {
@@ -200,18 +516,34 @@ public class ScreenshotToolWindow : EditorWindow
 
     private void CaptureCamera()
     {
-        Camera camera = m_TargetCamera != null ? m_TargetCamera : Camera.main;
+        Camera camera = ResolveTargetCamera(true);
         if (camera == null)
         {
-            EditorUtility.DisplayDialog("截图工具", "未找到可用相机，请先指定目标相机。", "确定");
             return;
         }
 
-        string filePath = CreateScreenshotPath();
-        if (!TryCaptureCameraToPng(camera, m_Width, m_Height, filePath, out string error))
+        string filePath = CreateOutputPath("png");
+        RenderTexture rt = new RenderTexture(m_Width, m_Height, 24, RenderTextureFormat.ARGB32);
+        Texture2D tex = new Texture2D(m_Width, m_Height, TextureFormat.RGBA32, false);
+
+        RenderTexture previousActive = RenderTexture.active;
+        RenderTexture previousTarget = camera.targetTexture;
+        try
         {
-            EditorUtility.DisplayDialog("截图工具", $"截图失败：{error}", "确定");
-            return;
+            camera.targetTexture = rt;
+            RenderTexture.active = rt;
+            camera.Render();
+            tex.ReadPixels(new Rect(0, 0, m_Width, m_Height), 0, 0);
+            tex.Apply(false, false);
+            byte[] pngData = tex.EncodeToPNG();
+            File.WriteAllBytes(filePath, pngData);
+        }
+        finally
+        {
+            camera.targetTexture = previousTarget;
+            RenderTexture.active = previousActive;
+            DestroyImmediate(rt);
+            DestroyImmediate(tex);
         }
 
         AssetDatabase.Refresh();
@@ -219,356 +551,489 @@ public class ScreenshotToolWindow : EditorWindow
         {
             EditorUtility.RevealInFinder(filePath);
         }
+
         Debug.Log($"[ScreenshotTool] 已保存相机截图: {filePath}");
     }
 
-    private string MakeSafeFileNamePart(string value)
+    private void ScheduleRecording(CameraTrajectoryPreset trajectoryPreset)
     {
-        if (string.IsNullOrEmpty(value))
+        if (IsRecordingActive() || m_IsRecordScheduled)
         {
-            return "Unnamed";
+            return;
         }
 
-        char[] invalidChars = Path.GetInvalidFileNameChars();
-        StringBuilder sb = new StringBuilder(value.Length);
-        for (int i = 0; i < value.Length; i++)
+        bool requiresAsyncGpuReadback = trajectoryPreset == null;
+        if (!ValidateFfmpegPath(requiresAsyncGpuReadback))
         {
-            char c = value[i];
-            bool invalid = false;
-            for (int j = 0; j < invalidChars.Length; j++)
-            {
-                if (c == invalidChars[j])
-                {
-                    invalid = true;
-                    break;
-                }
-            }
-
-            sb.Append(invalid ? '_' : c);
+            return;
         }
 
-        return sb.ToString();
+        if (trajectoryPreset != null && !ValidateTrajectoryPreset(trajectoryPreset, true))
+        {
+            return;
+        }
+
+        Camera recordCamera = ResolveTargetCamera(true);
+        if (recordCamera == null)
+        {
+            return;
+        }
+
+        string outputPath = CreateOutputPath("mp4");
+        m_PendingTrajectoryPreset = trajectoryPreset;
+        if (m_RecordDelaySeconds <= 0f)
+        {
+            StartRecording(outputPath, trajectoryPreset);
+            return;
+        }
+
+        m_IsRecordScheduled = true;
+        m_RecordStartTime = EditorApplication.timeSinceStartup + m_RecordDelaySeconds;
+        m_PendingRecordOutputPath = outputPath;
+        string scheduleMode = trajectoryPreset != null ? $"轨迹回放录制({trajectoryPreset.name})" : "直接相机录制";
+        Debug.Log($"[ScreenshotTool] {scheduleMode}任务已排队，将在 {m_RecordDelaySeconds:F1} 秒后开始。相机: {recordCamera.name}，输出: {outputPath}");
     }
 
-    private bool TryCaptureCameraToPng(Camera camera, int width, int height, string filePath, out string error)
+    private void StartRecording(string outputPath, CameraTrajectoryPreset trajectoryPreset)
     {
-        // 使用离屏 RT 强制渲染，并用 ReadPixels 读回，确保在 Editor（非 Play）也能稳定输出 PNG。
-        error = string.Empty;
-        if (camera == null)
+        Camera recordCamera = ResolveTargetCamera(true);
+        if (recordCamera == null)
         {
-            error = "Camera 为空。";
-            return false;
+            m_IsRecordScheduled = false;
+            m_PendingRecordOutputPath = string.Empty;
+            m_PendingTrajectoryPreset = null;
+            return;
         }
 
-        if (width <= 0 || height <= 0)
-        {
-            error = "截图分辨率无效。";
-            return false;
-        }
+        int recordWidth = EnsureEvenPositiveSize(m_RecordWidth);
+        int recordHeight = EnsureEvenPositiveSize(m_RecordHeight);
+        float activeRecordDurationSeconds = trajectoryPreset != null ? Mathf.Max(0.01f, trajectoryPreset.Duration) : Mathf.Max(1f, m_RecordDurationSeconds);
 
         try
         {
-            RenderTexture rt = new RenderTexture(width, height, 24, RenderTextureFormat.ARGB32);
-            Texture2D tex = new Texture2D(width, height, TextureFormat.RGBA32, false);
+            ResetRecordingState();
+            PrepareRecordResources(recordCamera, recordWidth, recordHeight);
+            BeginTrajectoryRecordingSession(recordCamera);
+            if (m_MovementMode == CameraMovementMode.Rig)
+            {
+                // 机位模式：备份相机姿态 + 启动 RigDriver（不走轨迹回放）
+                m_PlaybackRestorePosition = recordCamera.transform.position;
+                m_PlaybackRestoreRotation = recordCamera.transform.rotation;
+                m_PlaybackRestoreFieldOfView = recordCamera.fieldOfView;
+                m_PlaybackRestoreOrthographic = recordCamera.orthographic;
+                m_PlaybackRestoreOrthographicSize = recordCamera.orthographicSize;
+                m_RigDriver.Begin(recordCamera, m_RigWaypoints, m_RigLookAtTarget, m_RigSmoothTime, m_RigMaxSpeed);
+                m_LastRigUpdateTime = EditorApplication.timeSinceStartup;
+                PrepareOfflinePlaybackRecording(null, recordWidth, recordHeight, activeRecordDurationSeconds);
+            }
+            else
+            {
+                BeginTrajectoryPlayback(recordCamera, trajectoryPreset);
+                PrepareOfflinePlaybackRecording(trajectoryPreset, recordWidth, recordHeight, activeRecordDurationSeconds);
+            }
 
-            RenderTexture previousActive = RenderTexture.active;
-            RenderTexture previousTarget = camera.targetTexture;
-            try
+            ProcessStartInfo startInfo = new ProcessStartInfo
             {
-                camera.targetTexture = rt;
-                RenderTexture.active = rt;
-                camera.Render();
-                tex.ReadPixels(new Rect(0, 0, width, height), 0, 0);
-                tex.Apply(false, false);
-                byte[] pngData = tex.EncodeToPNG();
-                File.WriteAllBytes(filePath, pngData);
-                return true;
-            }
-            finally
+                FileName = m_FfmpegExePath,
+                Arguments = BuildFfmpegArguments(recordWidth, recordHeight, outputPath),
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            m_RecordProcess = new Process();
+            m_RecordProcess.StartInfo = startInfo;
+            m_RecordProcess.EnableRaisingEvents = true;
+            m_RecordProcess.OutputDataReceived += OnFfmpegDataReceived;
+            m_RecordProcess.ErrorDataReceived += OnFfmpegDataReceived;
+            m_RecordProcess.Start();
+            m_RecordProcess.BeginOutputReadLine();
+            m_RecordProcess.BeginErrorReadLine();
+
+            StartRecordWriterThread();
+
+            double startTime = EditorApplication.timeSinceStartup;
+            m_RecordingOutputPath = outputPath;
+            m_IsRecordScheduled = false;
+            m_PendingRecordOutputPath = string.Empty;
+            m_PendingTrajectoryPreset = null;
+            m_ActiveRecordDurationSeconds = activeRecordDurationSeconds;
+            m_RecordCaptureStartTime = startTime;
+            m_RecordEndTime = startTime + activeRecordDurationSeconds;
+            m_RecordNextFrameTime = startTime + RecordFrameInterval;
+
+            if (!m_IsOfflinePlaybackRecording)
             {
-                camera.targetTexture = previousTarget;
-                RenderTexture.active = previousActive;
-                DestroyImmediate(rt);
-                DestroyImmediate(tex);
+                CaptureRealtimeRecordFrame();
             }
+
+            string modeText = trajectoryPreset != null ? $"轨迹回放录制({trajectoryPreset.name})" : "直接相机录制";
+            Debug.Log($"[ScreenshotTool] 已开始{modeText}，相机 {recordCamera.name}，分辨率 {recordWidth}x{recordHeight}，时长 {activeRecordDurationSeconds:F1} 秒，输出: {outputPath}");
         }
         catch (Exception ex)
         {
-            error = ex.Message;
-            return false;
+            DisposeRecordingProcess(true);
+            m_IsRecordScheduled = false;
+            m_PendingRecordOutputPath = string.Empty;
+            m_PendingTrajectoryPreset = null;
+            EditorUtility.DisplayDialog("截图工具", $"启动相机录屏失败:\n{ex.Message}", "确定");
         }
     }
 
-    private void DrawVideoRecordingSettings()
+    private void StopRecording()
     {
-        EditorGUILayout.Space(8f);
-        EditorGUILayout.LabelField("Play 模式视频录制", EditorStyles.boldLabel);
-
-        using (new EditorGUILayout.HorizontalScope())
+        if (!IsRecordingActive())
         {
-            m_FfmpegPath = EditorGUILayout.TextField("ffmpeg.exe 路径", m_FfmpegPath);
-            if (GUILayout.Button("搜索", GUILayout.Width(52f)))
-            {
-                SearchAndApplyFfmpegPath(true);
-            }
-
-            if (GUILayout.Button("浏览", GUILayout.Width(52f)))
-            {
-                string selectedPath = EditorUtility.OpenFilePanel("选择 ffmpeg.exe", string.Empty, "exe");
-                if (!string.IsNullOrEmpty(selectedPath))
-                {
-                    m_FfmpegPath = selectedPath;
-                }
-            }
+            return;
         }
 
-        m_VideoFps = EditorGUILayout.IntField("帧率", m_VideoFps);
-        m_VideoFps = Mathf.Clamp(m_VideoFps, 1, 240);
-
-        m_VideoFixedDurationEnabled = EditorGUILayout.Toggle("固定时长", m_VideoFixedDurationEnabled);
-        if (m_VideoFixedDurationEnabled)
-        {
-            m_VideoDurationSeconds = EditorGUILayout.FloatField("录制秒数", m_VideoDurationSeconds);
-            m_VideoDurationSeconds = Mathf.Max(0.1f, m_VideoDurationSeconds);
-        }
-
-        m_KeepVideoFrames = EditorGUILayout.Toggle("保留帧数据", m_KeepVideoFrames);
-
-        EditorGUILayout.Space(4f);
-        EditorGUILayout.LabelField("录制质量", EditorStyles.boldLabel);
-        m_UseRecordingMsaa = EditorGUILayout.Toggle("录制RT MSAA", m_UseRecordingMsaa);
-        using (new EditorGUI.DisabledScope(!m_UseRecordingMsaa))
-        {
-            m_RecordingMsaaSamples = DrawMsaaPopup("录制RT MSAA质量", m_RecordingMsaaSamples);
-        }
-
-        m_OverrideUrpQuality = EditorGUILayout.Toggle("录制时覆盖URP质量", m_OverrideUrpQuality);
-        using (new EditorGUI.DisabledScope(!m_OverrideUrpQuality))
-        {
-            m_RecordingUrpRenderScale = EditorGUILayout.Slider("URP Render Scale", m_RecordingUrpRenderScale, 0.5f, 2f);
-            m_RecordingUrpMsaaSamples = DrawMsaaPopup("URP MSAA质量", m_RecordingUrpMsaaSamples);
-        }
-
-        m_UseHighQualityEncoding = EditorGUILayout.Toggle("高质量MP4编码", m_UseHighQualityEncoding);
-        using (new EditorGUI.DisabledScope(!m_UseHighQualityEncoding))
-        {
-            m_VideoCrf = EditorGUILayout.IntSlider("编码CRF(越低越高)", m_VideoCrf, 12, 28);
-            int presetIndex = Mathf.Max(0, Array.IndexOf(FfmpegPresetOptions, m_FfmpegPreset));
-            presetIndex = EditorGUILayout.Popup("编码Preset", presetIndex, FfmpegPresetOptions);
-            m_FfmpegPreset = FfmpegPresetOptions[presetIndex];
-        }
-
-        m_MaxPendingReadbackFrames = EditorGUILayout.IntSlider("最大待读回帧", m_MaxPendingReadbackFrames, 1, 8);
-
-        string status = m_IsRecording
-            ? $"录制中: {m_RecordingFrameIndex} 帧 / {EditorApplication.timeSinceStartup - m_RecordingStartTime:0.0}s / 待读回 {m_PendingReadbackCount} / 跳过 {m_DroppedRecordingFrameCount}"
-            : m_IsEncodingVideo
-                ? $"视频合成中: {m_EncodingOutputPath}"
-            : EditorApplication.isPlaying && m_RecordingRenderTexture != null
-                ? $"未录制 / {(m_RecordingReadbackPrewarmed ? "已预热" : "预热中")}"
-                : "未录制";
-        EditorGUILayout.LabelField("状态", status);
-
-        string buttonText = m_IsRecording ? "停止录制 (F9)" : "开始录制 (F9)";
-        if (GUILayout.Button(buttonText, GUILayout.Height(26f)))
-        {
-            ToggleRecording();
-        }
+        RequestStopRecording();
     }
 
-    private void ToggleRecording()
+    private void RequestStopRecording()
     {
-        if (m_IsRecording)
+        if (m_IsStoppingRecording)
         {
-            StopRecording(true);
+            return;
         }
-        else
-        {
-            StartRecording();
-        }
+
+        FinalizeTrajectoryRecordingCache();
+        m_IsStoppingRecording = true;
+        Debug.Log("[ScreenshotTool] 已请求停止录制，正在等待剩余帧写入完成。");
     }
 
-    private void StartRecording()
+    private void CancelScheduledRecording()
     {
-        if (!EditorApplication.isPlaying)
-        {
-            EditorUtility.DisplayDialog("截图工具", "视频录制只能在 Play 模式下开始。", "确定");
-            return;
-        }
-
-        if (m_IsEncodingVideo)
-        {
-            EditorUtility.DisplayDialog("截图工具", "上一个视频仍在合成中，请等待完成后再开始新的录制。", "确定");
-            return;
-        }
-
-        Camera camera = m_TargetCamera != null ? m_TargetCamera : Camera.main;
-        if (camera == null)
-        {
-            EditorUtility.DisplayDialog("截图工具", "未找到可用相机，请先指定目标相机。", "确定");
-            return;
-        }
-
-        if (!SystemInfo.supportsAsyncGPUReadback)
-        {
-            EditorUtility.DisplayDialog("截图工具", "当前设备不支持 AsyncGPUReadback，无法使用低卡顿视频录制。", "确定");
-            return;
-        }
-
-        m_RecordingWidth = Mathf.Max(1, m_Width * m_SuperSize);
-        m_RecordingHeight = Mathf.Max(1, m_Height * m_SuperSize);
-        ApplyRecordingQualityOverrides();
-        ApplyCameraQualityOverrides(camera);
-        EnsureRecordingTexture();
-        m_RecordingCamera = camera;
-        m_RecordingFrameIndex = 0;
-        m_WrittenRawFrameCount = 0;
-        m_DroppedRecordingFrameCount = 0;
-        m_RecordingStartTime = EditorApplication.timeSinceStartup;
-        m_RecordingStopTime = m_RecordingStartTime;
-        m_NextFrameTime = m_RecordingStartTime;
-        CreateVideoPaths(out m_RecordingFrameDirectory, out m_RecordingOutputPath);
-        m_RecordingRawVideoPath = Path.Combine(m_RecordingFrameDirectory, "frames.rgba");
-
-        StartRawFrameWriter();
-        m_IsRecording = true;
-
-        Debug.Log($"[ScreenshotTool] 开始录制视频帧流: {m_RecordingRawVideoPath}");
-        Repaint();
-    }
-
-    private void StopRecording(bool encodeVideo)
-    {
-        if (!m_IsRecording)
+        if (!m_IsRecordScheduled)
         {
             return;
         }
 
-        m_IsRecording = false;
-        m_RecordingStopTime = EditorApplication.timeSinceStartup;
-        AsyncGPUReadback.WaitAllRequests();
-        StopRawFrameWriter();
-        m_RecordingCamera = null;
-        RestoreCameraQualityOverrides();
-        RestoreRecordingQualityOverrides();
-
-        if (encodeVideo)
-        {
-            EncodeRecordingToMp4();
-        }
-
-        AssetDatabase.Refresh();
-        Repaint();
+        Debug.Log("[ScreenshotTool] 已取消延迟录屏任务。");
+        m_IsRecordScheduled = false;
+        m_PendingRecordOutputPath = string.Empty;
+        m_PendingTrajectoryPreset = null;
+        m_RecordStartTime = 0d;
     }
 
     private void OnEditorUpdate()
     {
-        if (!m_IsRecording)
+        double currentTime = EditorApplication.timeSinceStartup;
+
+        if (m_IsRecordScheduled && currentTime >= m_RecordStartTime)
         {
-            if (EditorApplication.isPlaying)
+            StartRecording(m_PendingRecordOutputPath, m_PendingTrajectoryPreset);
+        }
+
+        if (m_IsRecordScheduled || IsRecordingActive())
+        {
+            if (!Application.isPlaying)
             {
-                PrepareRecordingTextureForCurrentSettings();
+                EditorApplication.QueuePlayerLoopUpdate();
+            }
+            if (Time.frameCount % 5 == 0)
+            {
+                Repaint();
+            }
+            // 机位预览驱动（不录制，只移动相机观察运镜效果）
+            if (m_IsRigPreviewing)
+            {
+                if (Application.isPlaying)
+                {
+                    StopRigPreview();
+                }
+                else
+                {
+                    float deltaTime = Mathf.Clamp((float)(currentTime - m_LastRigUpdateTime), 0f, 0.1f);
+                    m_LastRigUpdateTime = currentTime;
+                    m_RigDriver.Update(deltaTime);
+                    if (m_RigDriver.IsFinished)
+                    {
+                        StopRigPreview();
+                    }
+                }
+            }
+        }
+
+        if (IsRecordingActive())
+        {
+            UpdateTrajectorySampling(currentTime);
+
+            if (!string.IsNullOrWhiteSpace(m_RecordPipelineError))
+            {
+                RequestStopRecording();
+            }
+            else if (m_IsOfflinePlaybackRecording)
+            {
+                UpdateOfflinePlaybackRecording();
+                // 机位模式下离线录制由 IsFinished 提前停止
+                if (m_MovementMode == CameraMovementMode.Rig && m_RigDriver.IsFinished)
+                {
+                    RequestStopRecording();
+                }
+            }
+            else
+            {
+                // 机位模式下由 IsFinished 决定停止，否则用 m_RecordEndTime
+                bool shouldStopByRig = m_MovementMode == CameraMovementMode.Rig && m_RigDriver.IsFinished;
+                if (!m_IsStoppingRecording && (currentTime >= m_RecordEndTime || shouldStopByRig))
+                {
+                    RequestStopRecording();
+                }
+
+                if (!m_IsStoppingRecording && currentTime >= m_RecordNextFrameTime && CanCaptureRealtimeRecordFrame())
+                {
+                    // Play 模式下同一渲染帧不重复 Render，避免 GPU 双倍渲染；编辑模式无 frameCount
+                    bool isSamePlayFrame = Application.isPlaying && m_LastRenderedFrameCount == Time.frameCount;
+                    if (!isSamePlayFrame)
+                    {
+                        CaptureRealtimeRecordFrame();
+                        m_LastRenderedFrameCount = Time.frameCount;
+                    }
+                    // 时间步无论是否实际渲染都推进，避免 CPU 空转
+                    m_RecordNextFrameTime += RecordFrameInterval;
+                    if (m_RecordNextFrameTime < currentTime - RecordFrameInterval)
+                    {
+                        m_RecordNextFrameTime = currentTime + RecordFrameInterval;
+                    }
+                }
             }
 
-            return;
+            TryCloseRecordInput();
         }
 
-        if (!EditorApplication.isPlaying)
+        if (m_RecordProcess != null && m_RecordProcess.HasExited)
         {
-            StopRecording(true);
-            return;
-        }
-
-        double now = EditorApplication.timeSinceStartup;
-        if (m_VideoFixedDurationEnabled && now - m_RecordingStartTime >= m_VideoDurationSeconds)
-        {
-            StopRecording(true);
-            return;
-        }
-
-        if (now < m_NextFrameTime)
-        {
-            return;
-        }
-
-        CaptureRecordingFrame();
-
-        double frameInterval = 1.0 / Mathf.Max(1, m_VideoFps);
-        m_NextFrameTime += frameInterval;
-        if (m_NextFrameTime < now)
-        {
-            m_NextFrameTime = now + frameInterval;
-        }
-
-        Repaint();
-    }
-
-    private void OnPlayModeStateChanged(PlayModeStateChange state)
-    {
-        if (m_IsRecording && state == PlayModeStateChange.ExitingPlayMode)
-        {
-            StopRecording(true);
-        }
-
-        if (state == PlayModeStateChange.ExitingPlayMode || state == PlayModeStateChange.EnteredEditMode)
-        {
-            RestoreRecordingQualityOverrides();
-            RestoreCameraQualityOverrides();
+            FinalizeRecording();
         }
     }
 
-    private void CaptureRecordingFrame()
+    /// <summary>
+    /// 将轨迹采样独立于视频抓帧单独执行。
+    /// 这样即使实时录屏因为高分辨率而掉帧，轨迹本身也仍可按更稳定的时间步被记录。
+    /// </summary>
+    /// <param name="currentTime">当前编辑器时间。</param>
+    private void UpdateTrajectorySampling(double currentTime)
     {
-        if (m_RecordingCamera == null || m_RecordingRenderTexture == null || m_RawFrameQueue == null)
+        if (!m_RecordCameraTrajectory || m_RecordingCamera == null || m_RecordCaptureStartTime <= 0d)
         {
-            StopRecording(true);
             return;
         }
 
-        if (m_PendingReadbackCount >= m_MaxPendingReadbackFrames)
+        if (m_IsOfflinePlaybackRecording)
         {
-            m_DroppedRecordingFrameCount++;
             return;
+        }
+
+        double sampleInterval = 1d / TrajectorySampleRate;
+        if (m_TrajectoryNextSampleTime <= 0d)
+        {
+            m_TrajectoryNextSampleTime = m_RecordCaptureStartTime;
+        }
+
+        while (currentTime >= m_TrajectoryNextSampleTime)
+        {
+            float sampleTime = Mathf.Clamp((float)(m_TrajectoryNextSampleTime - m_RecordCaptureStartTime), 0f, Mathf.Max(0f, m_ActiveRecordDurationSeconds));
+            RecordRawTrajectorySample(sampleTime);
+            m_TrajectoryNextSampleTime += sampleInterval;
+        }
+    }
+
+    private void FinalizeRecording()
+    {
+        if (m_RecordProcess == null)
+        {
+            return;
+        }
+
+        int exitCode = m_RecordProcess.ExitCode;
+        string outputPath = m_RecordingOutputPath;
+        string pipelineError = m_RecordPipelineError;
+        DisposeRecordingProcess(false);
+        AssetDatabase.Refresh();
+
+        if (exitCode == 0 && string.IsNullOrWhiteSpace(pipelineError) && File.Exists(outputPath))
+        {
+            Debug.Log($"[ScreenshotTool] 相机录屏完成: {outputPath}");
+            if (m_RevealInExplorer)
+            {
+                EditorUtility.RevealInFinder(outputPath);
+            }
+        }
+        else
+        {
+            Debug.LogError($"[ScreenshotTool] 相机录屏失败，ffmpeg 退出码: {exitCode}。流水线错误: {pipelineError}。最后日志: {m_LastRecordLogLine}");
+        }
+    }
+
+    /// <summary>
+    /// 普通实时录制模式下按当前编辑器节奏抓取一帧。
+    /// 该模式仍依赖编辑器实时刷新频率，因此更适合快速直录。
+    /// </summary>
+    private void CaptureRealtimeRecordFrame()
+    {
+        if (m_RecordProcess == null || m_RecordRenderTexture == null || m_RecordingCamera == null)
+        {
+            return;
+        }
+
+        if (m_MovementMode == CameraMovementMode.Rig)
+        {
+            float deltaTime = Mathf.Clamp((float)(EditorApplication.timeSinceStartup - m_LastRigUpdateTime), 0f, 0.1f);
+            m_RigDriver.Update(deltaTime);
+            m_LastRigUpdateTime = EditorApplication.timeSinceStartup;
+        }
+        else
+        {
+            float currentRecordTime = GetCurrentRecordElapsedSeconds();
+            ApplyPlaybackTrajectory(currentRecordTime);
+        }
+
+        RenderTexture previousTarget = m_RecordingCamera.targetTexture;
+        try
+        {
+            m_RecordingCamera.targetTexture = m_RecordRenderTexture;
+            m_RecordingCamera.Render();
+            m_PendingReadbackCount++;
+            NativeArray<byte> targetArray = new NativeArray<byte>(
+              m_RecordFrameByteSize, Allocator.Persistent,
+                NativeArrayOptions.UninitializedMemory);
+            AsyncGPUReadback.RequestIntoNativeArray(ref targetArray, m_RecordRenderTexture, 0, TextureFormat.RGBA32,
+                                                    request => OnRecordFrameReadback(request, targetArray));
+        }
+        catch (Exception ex)
+        {
+            m_PendingReadbackCount = Mathf.Max(0, m_PendingReadbackCount - 1);
+            m_RecordPipelineError = $"采集相机帧失败: {ex.Message}";
+        }
+        finally
+        {
+            m_RecordingCamera.targetTexture = previousTarget;
+        }
+    }
+
+    /// <summary>
+    /// 检查实时录制链路是否还有可安全推进的新帧容量。
+    /// 通过限制 GPU 回读中的帧数与待写入队列深度，避免主线程持续堆积大块内存，
+    /// 从而减轻录制过程中因为 GC 和写入跟不上带来的明显卡顿。
+    /// </summary>
+    /// <returns>链路还有余量时返回 true。</returns>
+    private bool CanCaptureRealtimeRecordFrame()
+    {
+        if (m_PendingReadbackCount >= MaxPendingGpuReadbackCount)
+        {
+            return false;
+        }
+
+        lock (m_RecordFrameQueueLock)
+        {
+            return m_RecordFrameQueue.Count < MaxQueuedRecordFrameCount;
+        }
+    }
+
+    /// <summary>
+    /// 初始化轨迹回放录制的离线逐帧采样资源。
+    /// 只有在选择了轨迹预设时才启用，普通录制仍保持原有实时模式。
+    /// </summary>
+    /// <param name="trajectoryPreset">当前是否为轨迹回放录制。</param>
+    /// <param name="recordWidth">输出宽度。</param>
+    /// <param name="recordHeight">输出高度。</param>
+    /// <param name="recordDurationSeconds">本次录制总时长。</param>
+    private void PrepareOfflinePlaybackRecording(CameraTrajectoryPreset trajectoryPreset, int recordWidth, int recordHeight, float recordDurationSeconds)
+    {
+        m_IsOfflinePlaybackRecording = trajectoryPreset != null || m_MovementMode == CameraMovementMode.Rig;
+        m_OfflinePlaybackFrameIndex = 0;
+        m_OfflinePlaybackFrameCount = 0;
+
+        if (!m_IsOfflinePlaybackRecording)
+        {
+            return;
+        }
+
+        m_OfflinePlaybackFrameCount = Mathf.Max(1, Mathf.CeilToInt(recordDurationSeconds * RecordFrameRate));
+        m_OfflinePlaybackReadTexture = new Texture2D(recordWidth, recordHeight, TextureFormat.RGBA32, false, false)
+        {
+            name = "Azumi_ScreenshotTool_OfflineReadTexture"
+        };
+    }
+
+    /// <summary>
+    /// 离线逐帧录制驱动。
+    /// 每次 Editor 更新只推进一个固定帧编号，不依赖真实时间，从而避免回放录制时的抖动和跳帧。
+    /// </summary>
+    private void UpdateOfflinePlaybackRecording()
+    {
+        if (m_IsStoppingRecording)
+        {
+            return;
+        }
+
+        if (m_OfflinePlaybackFrameIndex >= m_OfflinePlaybackFrameCount)
+        {
+            FinalizeTrajectoryRecordingCache();
+            RequestStopRecording();
+            return;
+        }
+
+        CaptureOfflinePlaybackFrame(m_OfflinePlaybackFrameIndex);
+        m_OfflinePlaybackFrameIndex++;
+
+        if (!string.IsNullOrWhiteSpace(m_RecordPipelineError))
+        {
+            RequestStopRecording();
+            return;
+        }
+
+        if (m_OfflinePlaybackFrameIndex >= m_OfflinePlaybackFrameCount)
+        {
+            FinalizeTrajectoryRecordingCache();
+            RequestStopRecording();
+        }
+    }
+
+    /// <summary>
+    /// 按固定帧编号采样轨迹并同步输出一帧原始视频数据。
+    /// 即使编辑器当前刷新很慢，输出视频仍然严格保持目标帧率的时间步进。
+    /// </summary>
+    /// <param name="frameIndex">当前要录制的目标帧编号。</param>
+    private void CaptureOfflinePlaybackFrame(int frameIndex)
+    {
+        if (m_RecordProcess == null || m_RecordRenderTexture == null || m_RecordingCamera == null || m_OfflinePlaybackReadTexture == null)
+        {
+            return;
+        }
+
+        if (m_MovementMode == CameraMovementMode.Rig)
+        {
+            m_RigDriver.Update(1f / RecordFrameRate);
+        }
+        else
+        {
+            float recordTime = Mathf.Min(m_ActiveRecordDurationSeconds, frameIndex / (float)RecordFrameRate);
+            ApplyPlaybackTrajectory(recordTime);
+            RecordRawTrajectorySample(recordTime);
         }
 
         RenderTexture previousActive = RenderTexture.active;
         RenderTexture previousTarget = m_RecordingCamera.targetTexture;
         try
         {
-            m_RecordingCamera.targetTexture = m_RecordingRenderTexture;
-            RenderTexture.active = m_RecordingRenderTexture;
+            m_RecordingCamera.targetTexture = m_RecordRenderTexture;
+            RenderTexture.active = m_RecordRenderTexture;
             m_RecordingCamera.Render();
-            Graphics.Blit(m_RecordingRenderTexture, m_RecordingReadbackTexture);
+            m_OfflinePlaybackReadTexture.ReadPixels(new Rect(0f, 0f, m_RecordRenderTexture.width, m_RecordRenderTexture.height), 0, 0, false);
+            m_OfflinePlaybackReadTexture.Apply(false, false);
 
-            m_RecordingFrameIndex++;
-            int frameIndex = m_RecordingFrameIndex;
-            Interlocked.Increment(ref m_PendingReadbackCount);
-            AsyncGPUReadback.Request(m_RecordingReadbackTexture, 0, TextureFormat.RGBA32, request =>
-            {
-                try
-                {
-                    if (request.hasError)
-                    {
-                        m_RawWriterFailed = true;
-                        m_RawWriterError = $"AsyncGPUReadback failed at frame {frameIndex}.";
-                        return;
-                    }
-
-                    Unity.Collections.NativeArray<byte> readbackData = request.GetData<byte>();
-                    byte[] frameData = ArrayPool<byte>.Shared.Rent(readbackData.Length);
-                    readbackData.CopyTo(frameData);
-                    m_RawFrameQueue?.Enqueue(new RawVideoFrame
-                    {
-                        Index = frameIndex,
-                        Data = frameData,
-                        Length = readbackData.Length
-                    });
-                }
-                finally
-                {
-                    Interlocked.Decrement(ref m_PendingReadbackCount);
-                }
-            });
+            NativeArray<byte> sourceData = m_OfflinePlaybackReadTexture.GetRawTextureData<byte>();
+            NativeArray<byte> frameData = new NativeArray<byte>(sourceData.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+            sourceData.CopyTo(frameData);
+            EnqueueRecordFrame(frameData);
+        }
+        catch (Exception ex)
+        {
+            m_RecordPipelineError = $"离线采集相机帧失败: {ex.Message}";
         }
         finally
         {
@@ -577,678 +1042,879 @@ public class ScreenshotToolWindow : EditorWindow
         }
     }
 
-    private void EncodeRecordingToMp4()
+    private void OnRecordFrameReadback(AsyncGPUReadbackRequest request, NativeArray<byte>
+  frameData)
     {
-        if (m_WrittenRawFrameCount <= 0)
+        m_PendingReadbackCount = Mathf.Max(0, m_PendingReadbackCount - 1);
+
+        if (request.hasError)
         {
-            Debug.LogWarning("[ScreenshotTool] 没有录到任何视频帧，已跳过 mp4 编码。");
+            if (frameData.IsCreated) frameData.Dispose();
+            m_RecordPipelineError = "GPU 回读失败，请检查当前平台是否支持 AsyncGPUReadback。";
             return;
         }
 
-        if (m_RawWriterFailed)
+        if (m_RecordProcess == null)
         {
-            EditorUtility.DisplayDialog("截图工具", "录制帧写入失败，已跳过 mp4 编码。详情请查看 Console。", "确定");
-            Debug.LogError($"[ScreenshotTool] 录制帧写入失败，帧数据保留在: {m_RecordingFrameDirectory}\n{m_RawWriterError}");
+            if (frameData.IsCreated) frameData.Dispose();
             return;
         }
-
-        if (string.IsNullOrWhiteSpace(m_FfmpegPath) || !File.Exists(m_FfmpegPath))
-        {
-            if (!SearchAndApplyFfmpegPath(false))
-            {
-                EditorUtility.DisplayDialog("截图工具", "未找到 ffmpeg.exe，已保留帧数据，未生成 mp4。请安装 ffmpeg，或在面板中指定 ffmpeg.exe 路径。", "确定");
-                Debug.LogWarning($"[ScreenshotTool] 未找到 ffmpeg.exe，帧数据保留在: {m_RecordingFrameDirectory}");
-                return;
-            }
-        }
-
-        double recordedSeconds = Math.Max(0.001d, m_RecordingStopTime - m_RecordingStartTime);
-        double encodeFrameRate = Math.Max(0.001d, m_WrittenRawFrameCount / recordedSeconds);
-        string encodeFrameRateText = encodeFrameRate.ToString("0.###", CultureInfo.InvariantCulture);
-        string videoSize = $"{m_RecordingWidth}x{m_RecordingHeight}";
-        string qualityArguments = m_UseHighQualityEncoding
-            ? $"-crf {m_VideoCrf} -preset {m_FfmpegPreset} "
-            : string.Empty;
-        string arguments = $"-y -f rawvideo -pixel_format rgba -video_size {videoSize} -framerate {encodeFrameRateText} -i {Quote(m_RecordingRawVideoPath)} -vf vflip -r {m_VideoFps} -c:v libx264 {qualityArguments}-pix_fmt yuv420p -movflags +faststart {Quote(m_RecordingOutputPath)}";
-
-        ProcessStartInfo startInfo = new ProcessStartInfo
-        {
-            FileName = m_FfmpegPath,
-            Arguments = arguments,
-            CreateNoWindow = true,
-            UseShellExecute = false,
-            RedirectStandardError = true,
-            RedirectStandardOutput = false
-        };
 
         try
         {
-            Process process = new Process
-            {
-                StartInfo = startInfo,
-                EnableRaisingEvents = true
-            };
-            StringBuilder stderrBuilder = new StringBuilder();
-            object stderrLock = new object();
-
-            process.ErrorDataReceived += (_, args) =>
-            {
-                if (args.Data == null)
-                {
-                    return;
-                }
-
-                lock (stderrLock)
-                {
-                    stderrBuilder.AppendLine(args.Data);
-                }
-            };
-
-            string outputPath = m_RecordingOutputPath;
-            string frameDirectory = m_RecordingFrameDirectory;
-            bool keepFrames = m_KeepVideoFrames;
-            bool revealInExplorer = m_RevealInExplorer;
-            double loggedRecordedSeconds = recordedSeconds;
-            double loggedEncodeFrameRate = encodeFrameRate;
-            int loggedFrameCount = m_WrittenRawFrameCount;
-
-            process.Exited += (_, _) =>
-            {
-                int exitCode = process.ExitCode;
-                process.WaitForExit();
-                string stderr;
-                lock (stderrLock)
-                {
-                    stderr = stderrBuilder.ToString();
-                }
-
-                EditorApplication.delayCall += () =>
-                {
-                    CompleteVideoEncoding(process, exitCode, stderr, outputPath, frameDirectory, keepFrames, revealInExplorer, loggedRecordedSeconds, loggedEncodeFrameRate, loggedFrameCount);
-                };
-            };
-
-            if (!process.Start())
-            {
-                process.Dispose();
-                throw new InvalidOperationException("ffmpeg process was not started.");
-            }
-
-            m_EncodingProcess = process;
-            m_IsEncodingVideo = true;
-            m_EncodingOutputPath = outputPath;
-            process.BeginErrorReadLine();
-            Debug.Log($"[ScreenshotTool] 已开始后台合成视频: {outputPath}");
-            Repaint();
+            EnqueueRecordFrame(frameData);
         }
-        catch (Exception exception)
+        catch (Exception ex)
         {
-            Debug.LogError($"[ScreenshotTool] ffmpeg 编码异常，帧数据保留在: {m_RecordingFrameDirectory}\n{exception}");
-            EditorUtility.DisplayDialog("截图工具", "ffmpeg 编码异常，已保留帧数据。详情请查看 Console。", "确定");
-            return;
+            if (frameData.IsCreated) frameData.Dispose();
+            m_RecordPipelineError = $"处理相机帧数据失败: {ex.Message}";
         }
     }
 
-    private void CompleteVideoEncoding(
-        Process process,
-        int exitCode,
-        string stderr,
-        string outputPath,
-        string frameDirectory,
-        bool keepFrames,
-        bool revealInExplorer,
-        double recordedSeconds,
-        double encodeFrameRate,
-        int frameCount)
+    private void EnqueueRecordFrame(NativeArray<byte> frameData)
     {
-        if (m_EncodingProcess == process)
+        lock (m_RecordFrameQueueLock)
         {
-            m_EncodingProcess = null;
-            m_IsEncodingVideo = false;
-            m_EncodingOutputPath = string.Empty;
+            m_RecordFrameQueue.Enqueue(frameData);
         }
 
-        process.Dispose();
+        m_RecordFrameEvent.Set();
+    }
 
-        if (exitCode != 0 || !File.Exists(outputPath))
+    private void TryCloseRecordInput()
+    {
+        if (!m_IsStoppingRecording || m_IsRecordInputClosing)
         {
-            Debug.LogError($"[ScreenshotTool] ffmpeg 编码失败，帧数据保留在: {frameDirectory}\n{stderr}");
-            EditorUtility.DisplayDialog("截图工具", "ffmpeg 编码失败，已保留帧数据。详情请查看 Console。", "确定");
-            Repaint();
             return;
         }
 
-        if (!keepFrames && Directory.Exists(frameDirectory))
+        bool hasQueuedFrame;
+        lock (m_RecordFrameQueueLock)
         {
-            Directory.Delete(frameDirectory, true);
+            hasQueuedFrame = m_RecordFrameQueue.Count > 0;
         }
 
-        AssetDatabase.Refresh();
-        if (revealInExplorer)
+        if (m_PendingReadbackCount > 0 || hasQueuedFrame || m_IsWritingRecordFrame)
         {
-            EditorUtility.RevealInFinder(outputPath);
+            return;
         }
 
-        Debug.Log($"[ScreenshotTool] 已保存视频: {outputPath}，录制时长 {recordedSeconds:0.###} 秒，实际帧率 {encodeFrameRate:0.###} fps，写入帧数 {frameCount}。");
-        Repaint();
+        m_IsRecordInputClosing = true;
+        m_RecordWriterRunning = false;
+        m_RecordFrameEvent.Set();
     }
 
-    private void StartRawFrameWriter()
+    private void StartRecordWriterThread()
     {
-        m_RawFrameQueue = new ConcurrentQueue<RawVideoFrame>();
-        m_RawWriterShouldStop = false;
-        m_RawWriterFailed = false;
-        m_RawWriterError = string.Empty;
-        m_PendingReadbackCount = 0;
-
-        m_RawWriterThread = new Thread(WriteRawFrames)
+        m_RecordWriterRunning = true;
+        m_RecordWriterExited = false;
+        m_RecordWriterThread = new Thread(RecordFrameWriterLoop)
         {
             IsBackground = true,
-            Name = "ScreenshotTool Raw Frame Writer"
+            Name = "AzumiCameraRecordWriter"
         };
-        m_RawWriterThread.Start();
+        m_RecordWriterThread.Start();
     }
 
-    private void StopRawFrameWriter()
+    private void RecordFrameWriterLoop()
     {
-        m_RawWriterShouldStop = true;
-        if (m_RawWriterThread != null)
-        {
-            m_RawWriterThread.Join();
-            m_RawWriterThread = null;
-        }
-
-        m_RawFrameQueue = null;
-    }
-
-    private void WriteRawFrames()
-    {
-        Dictionary<int, RawVideoFrame> pendingFrames = new Dictionary<int, RawVideoFrame>();
-        int nextFrameIndex = 1;
-
+        byte[] frameBytes = null; // 循环外复用，避免每帧 LOH 分配
         try
         {
-            using (FileStream stream = new FileStream(m_RecordingRawVideoPath, FileMode.Create, FileAccess.Write, FileShare.Read, 1024 * 1024))
+            while (true)
             {
-                while (!m_RawWriterShouldStop || (m_RawFrameQueue != null && !m_RawFrameQueue.IsEmpty) || pendingFrames.ContainsKey(nextFrameIndex))
+                NativeArray<byte> frameData = default;
+                bool hasFrame = false;
+                lock (m_RecordFrameQueueLock)
                 {
-                    while (m_RawFrameQueue != null && m_RawFrameQueue.TryDequeue(out RawVideoFrame frame))
+                    if (m_RecordFrameQueue.Count > 0)
                     {
-                        pendingFrames[frame.Index] = frame;
+                        frameData = m_RecordFrameQueue.Dequeue();
+                        hasFrame = true;
+                        m_IsWritingRecordFrame = true;
                     }
-
-                    bool wroteFrame = false;
-                    while (pendingFrames.TryGetValue(nextFrameIndex, out RawVideoFrame pendingFrame))
+                    else if (!m_RecordWriterRunning)
                     {
-                        stream.Write(pendingFrame.Data, 0, pendingFrame.Length);
-                        ArrayPool<byte>.Shared.Return(pendingFrame.Data);
-                        pendingFrames.Remove(nextFrameIndex);
-                        nextFrameIndex++;
-                        m_WrittenRawFrameCount = nextFrameIndex - 1;
-                        wroteFrame = true;
+                        break;
                     }
+                }
 
-                    if (!wroteFrame)
+                if (!hasFrame)
+                {
+                    m_RecordFrameEvent.WaitOne(100);
+                    continue;
+                }
+
+                try
+                {
+                    if (m_RecordProcess != null && !m_RecordProcess.HasExited &&
+  frameData.IsCreated)
                     {
-                        Thread.Sleep(1);
+                        if (frameBytes == null || frameBytes.Length < frameData.Length)
+                        {
+                            frameBytes = new byte[frameData.Length];
+                        }
+                        frameData.CopyTo(frameBytes);
+                        if (m_RecordProcess != null && !m_RecordProcess.HasExited)
+                        {
+                            m_RecordProcess.StandardInput.BaseStream.Write(frameBytes, 0, frameData.Length);
+                        }
+
+                    }
+                }
+                catch (Exception ex)
+                {
+                    m_RecordPipelineError = $"写入 ffmpeg 视频帧失败: {ex.Message}";
+                    m_RecordWriterRunning = false;
+                }
+                finally
+                {
+                    m_IsWritingRecordFrame = false;
+                    if (frameData.IsCreated)
+                    {
+                        frameData.Dispose();
                     }
                 }
             }
-        }
-        catch (Exception exception)
-        {
-            m_RawWriterFailed = true;
-            m_RawWriterError = exception.ToString();
+
+            try
+            {
+                if (m_RecordProcess != null && !m_RecordProcess.HasExited)
+                {
+                    m_RecordProcess.StandardInput.BaseStream.Flush();
+                    m_RecordProcess.StandardInput.Close();
+                }
+            }
+            catch (Exception ex)
+            {
+                if (string.IsNullOrWhiteSpace(m_RecordPipelineError))
+                {
+                    m_RecordPipelineError = $"关闭 ffmpeg 输入流失败: {ex.Message}";
+                }
+            }
         }
         finally
         {
-            foreach (RawVideoFrame frame in pendingFrames.Values)
+            m_IsWritingRecordFrame = false;
+            m_RecordWriterExited = true;
+        }
+    }
+
+    private void PrepareRecordResources(Camera recordCamera, int recordWidth, int recordHeight)
+    {
+        CleanupRecordResources();
+        m_RecordingCamera = recordCamera;
+        m_RecordFrameByteSize = recordWidth * recordHeight * 4;
+        m_RecordRenderTexture = new RenderTexture(recordWidth, recordHeight, 24, RenderTextureFormat.ARGB32)
+        {
+            name = "Azumi_ScreenshotTool_RecordRT",
+            antiAliasing = 1,
+            useMipMap = false,
+            autoGenerateMips = false
+        };
+        m_RecordRenderTexture.Create();
+    }
+
+    private void CleanupRecordResources()
+    {
+        if (m_OfflinePlaybackReadTexture != null)
+        {
+            DestroyImmediate(m_OfflinePlaybackReadTexture);
+            m_OfflinePlaybackReadTexture = null;
+        }
+
+        m_RecordingCamera = null;
+        if (m_RecordRenderTexture != null)
+        {
+            m_RecordRenderTexture.Release();
+            DestroyImmediate(m_RecordRenderTexture);
+            m_RecordRenderTexture = null;
+        }
+    }
+
+    private void ResetRecordingState()
+    {
+        m_IsStoppingRecording = false;
+        m_IsRecordInputClosing = false;
+        m_RecordEndTime = 0d;
+        m_RecordNextFrameTime = 0d;
+        m_RecordCaptureStartTime = 0d;
+        m_TrajectoryNextSampleTime = 0d;
+        m_PendingReadbackCount = 0;
+        m_LastRecordLogLine = string.Empty;
+        m_RecordPipelineError = string.Empty;
+        m_RecordWriterRunning = false;
+        m_RecordWriterExited = true;
+        m_IsWritingRecordFrame = false;
+        m_ActiveRecordDurationSeconds = 0f;
+        m_RecordFrameByteSize = 0;
+        m_IsOfflinePlaybackRecording = false;
+        m_OfflinePlaybackFrameIndex = 0;
+        m_OfflinePlaybackFrameCount = 0;
+        m_RawRecordedTrajectoryKeyframes.Clear();
+
+        lock (m_RecordFrameQueueLock)
+        {
+            while (m_RecordFrameQueue.Count > 0)
             {
-                ArrayPool<byte>.Shared.Return(frame.Data);
+                NativeArray<byte> frameData = m_RecordFrameQueue.Dequeue();
+                if (frameData.IsCreated) frameData.Dispose();
+            }
+
+            m_RecordFrameQueue.Clear();
+        }
+        m_RigDriver.Reset();
+        m_IsRigPreviewing = false;
+    }
+
+    /// <summary>
+    /// 从缓冲池中复用一块与当前录制分辨率匹配的原始帧缓冲。
+    /// 录屏每帧都是完整 RGBA 原始数据，如果持续 new 新数组会制造大量托管堆压力，
+    /// 因此这里优先复用旧缓冲，尽量减少录制期的大对象分配。
+    /// </summary>
+    /// <param name="requiredLength">本帧所需字节数。</param>
+    /// <returns>可写入当前帧数据的字节数组。</returns>
+    /* private byte[] RentRecordFrameBuffer(int requiredLength)
+    {
+        lock (m_RecordFrameBufferPoolLock)
+        {
+            while (m_RecordFrameBufferPool.Count > 0)
+            {
+                byte[] cachedBuffer = m_RecordFrameBufferPool.Pop();
+                if (cachedBuffer != null && cachedBuffer.Length == requiredLength)
+                {
+                    return cachedBuffer;
+                }
+            }
+        }
+
+        return new byte[requiredLength];
+    } */
+
+    /// <summary>
+    /// 将已写入 ffmpeg 的帧缓冲归还到池中，供后续帧继续复用。
+    /// 只缓存当前分辨率对应的缓冲区，避免切换分辨率后残留无效大数组。
+    /// </summary>
+    /// <param name="frameBytes">准备回收的帧缓冲。</param>
+    /* private void ReturnRecordFrameBuffer(byte[] frameBytes)
+    {
+        if (frameBytes == null || m_RecordFrameByteSize <= 0 || frameBytes.Length != m_RecordFrameByteSize)
+        {
+            return;
+        }
+
+        lock (m_RecordFrameBufferPoolLock)
+        {
+            if (m_RecordFrameBufferPool.Count < MaxRecordFrameBufferPoolCount)
+            {
+                m_RecordFrameBufferPool.Push(frameBytes);
+            }
+        }
+    } */
+
+    /// <summary>
+    /// 开始一轮新的轨迹采样缓存。
+    /// 每次正式开始录制前都会重置最近一次轨迹结果，避免用户误保存旧数据。
+    /// </summary>
+    /// <param name="recordCamera">当前用于录制的相机。</param>
+    private void BeginTrajectoryRecordingSession(Camera recordCamera)
+    {
+        m_RawRecordedTrajectoryKeyframes.Clear();
+        m_LastRecordedTrajectoryKeyframes.Clear();
+        m_LastRecordedTrajectoryCameraName = recordCamera != null ? recordCamera.name : string.Empty;
+        m_LastRecordedTrajectoryDuration = 0f;
+        m_TrajectoryNextSampleTime = 0d;
+
+        if (!m_RecordCameraTrajectory || recordCamera == null)
+        {
+            return;
+        }
+
+        RecordRawTrajectorySample(0f);
+    }
+
+    /// <summary>
+    /// 如果本次录制指定了轨迹预设，则提前记录相机原始状态并把相机切到轨迹起点。
+    /// 这样录制结束后可以无侵入地恢复用户原本的场景相机姿态。
+    /// </summary>
+    /// <param name="recordCamera">即将被驱动回放的相机。</param>
+    /// <param name="trajectoryPreset">待回放的轨迹预设，传空表示普通录制。</param>
+    private void BeginTrajectoryPlayback(Camera recordCamera, CameraTrajectoryPreset trajectoryPreset)
+    {
+        m_ActiveTrajectoryPreset = null;
+        m_IsTrajectoryPlaybackActive = false;
+
+        if (recordCamera == null || trajectoryPreset == null)
+        {
+            return;
+        }
+
+        m_PlaybackRestorePosition = recordCamera.transform.position;
+        m_PlaybackRestoreRotation = recordCamera.transform.rotation;
+        m_PlaybackRestoreFieldOfView = recordCamera.fieldOfView;
+        m_PlaybackRestoreOrthographic = recordCamera.orthographic;
+        m_PlaybackRestoreOrthographicSize = recordCamera.orthographicSize;
+        m_ActiveTrajectoryPreset = trajectoryPreset;
+        m_IsTrajectoryPlaybackActive = true;
+        ApplyPlaybackTrajectory(0f);
+    }
+
+    /// <summary>
+    /// 在录制驱动循环中按当前时间对轨迹预设取样，并写回目标相机。
+    /// </summary>
+    /// <param name="recordTime">相对录制起点的时间。</param>
+    private void ApplyPlaybackTrajectory(float recordTime)
+    {
+        if (!m_IsTrajectoryPlaybackActive || m_ActiveTrajectoryPreset == null || m_RecordingCamera == null)
+        {
+            return;
+        }
+
+        Vector3 position;
+        Quaternion rotation;
+        float fieldOfView;
+        bool isOrthographic;
+        float orthographicSize;
+        m_ActiveTrajectoryPreset.Evaluate(recordTime, out position, out rotation, out fieldOfView, out isOrthographic, out orthographicSize);
+        m_RecordingCamera.transform.SetPositionAndRotation(position, rotation);
+        m_RecordingCamera.orthographic = isOrthographic;
+        if (isOrthographic)
+        {
+            m_RecordingCamera.orthographicSize = orthographicSize;
+        }
+        else
+        {
+            m_RecordingCamera.fieldOfView = fieldOfView;
+        }
+    }
+
+    /// <summary>
+    /// 记录原始轨迹采样点。
+    /// 录制阶段尽量保留更多原始时间点，后续再统一重采样为稳定轨迹。
+    /// </summary>
+    /// <param name="recordTime">相对录制起点的时间。</param>
+    private void RecordRawTrajectorySample(float recordTime)
+    {
+        if (!m_RecordCameraTrajectory || m_RecordingCamera == null)
+        {
+            return;
+        }
+
+        CameraTrajectoryKeyframe keyframe = CameraTrajectoryKeyframe.CreateFromCamera(m_RecordingCamera, Mathf.Max(0f, recordTime));
+        int lastIndex = m_RawRecordedTrajectoryKeyframes.Count - 1;
+        if (lastIndex >= 0 && Mathf.Abs(m_RawRecordedTrajectoryKeyframes[lastIndex].m_Time - keyframe.m_Time) <= 0.0001f)
+        {
+            m_RawRecordedTrajectoryKeyframes[lastIndex] = keyframe;
+        }
+        else
+        {
+            m_RawRecordedTrajectoryKeyframes.Add(keyframe);
+        }
+    }
+
+    /// <summary>
+    /// 将原始轨迹采样点重采样为稳定的目标帧率轨迹，并写入最近一次录制缓存。
+    /// 自动回放录制读取的就是这份缓存，从而避免原始实时录制掉帧直接污染最终运镜。
+    /// </summary>
+    private void FinalizeTrajectoryRecordingCache()
+    {
+        if (!m_RecordCameraTrajectory)
+        {
+            m_LastRecordedTrajectoryKeyframes.Clear();
+            m_LastRecordedTrajectoryDuration = 0f;
+            return;
+        }
+
+        float duration = Mathf.Max(0f, m_ActiveRecordDurationSeconds);
+        if (m_RawRecordedTrajectoryKeyframes.Count == 0 && m_RecordingCamera != null)
+        {
+            RecordRawTrajectorySample(0f);
+        }
+
+        if (m_RawRecordedTrajectoryKeyframes.Count == 0)
+        {
+            m_LastRecordedTrajectoryKeyframes.Clear();
+            m_LastRecordedTrajectoryDuration = 0f;
+            return;
+        }
+
+        List<CameraTrajectoryKeyframe> resampledKeyframes = ResampleTrajectoryKeyframes(m_RawRecordedTrajectoryKeyframes, duration, RecordFrameRate);
+        m_LastRecordedTrajectoryKeyframes.Clear();
+        m_LastRecordedTrajectoryKeyframes.AddRange(resampledKeyframes);
+        m_LastRecordedTrajectoryDuration = duration;
+    }
+
+    /// <summary>
+    /// 按固定帧率对原始轨迹进行重采样。
+    /// 对位置、旋转和镜头参数做线性/球形插值，得到时间分布稳定的回放轨迹。
+    /// </summary>
+    /// <param name="sourceKeyframes">原始采样点。</param>
+    /// <param name="duration">轨迹时长。</param>
+    /// <param name="sampleRate">目标采样帧率。</param>
+    /// <returns>重采样后的关键帧列表。</returns>
+    private List<CameraTrajectoryKeyframe> ResampleTrajectoryKeyframes(List<CameraTrajectoryKeyframe> sourceKeyframes, float duration, int sampleRate)
+    {
+        List<CameraTrajectoryKeyframe> result = new List<CameraTrajectoryKeyframe>();
+        if (sourceKeyframes == null || sourceKeyframes.Count == 0)
+        {
+            return result;
+        }
+
+        sourceKeyframes.Sort(CompareTrajectoryKeyframeTime);
+        if (sourceKeyframes.Count == 1 || duration <= 0f)
+        {
+            result.Add(CloneTrajectoryKeyframeAtTime(sourceKeyframes[0], 0f));
+            return result;
+        }
+
+        int sampleCount = Mathf.Max(MinTrajectoryKeyframeCount, Mathf.RoundToInt(duration * Mathf.Max(1, sampleRate)) + 1);
+        for (int index = 0; index < sampleCount; index++)
+        {
+            float normalized = sampleCount <= 1 ? 0f : index / (float)(sampleCount - 1);
+            float sampleTime = Mathf.Lerp(0f, duration, normalized);
+            result.Add(EvaluateTrajectoryKeyframe(sourceKeyframes, sampleTime));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 在原始轨迹上按时间采样单个关键帧。
+    /// </summary>
+    /// <param name="sourceKeyframes">原始采样点。</param>
+    /// <param name="sampleTime">目标时间。</param>
+    /// <returns>插值后的关键帧。</returns>
+    private CameraTrajectoryKeyframe EvaluateTrajectoryKeyframe(List<CameraTrajectoryKeyframe> sourceKeyframes, float sampleTime)
+    {
+        if (sourceKeyframes == null || sourceKeyframes.Count == 0)
+        {
+            return new CameraTrajectoryKeyframe();
+        }
+
+        if (sourceKeyframes.Count == 1)
+        {
+            return CloneTrajectoryKeyframeAtTime(sourceKeyframes[0], sampleTime);
+        }
+
+        float clampedTime = Mathf.Clamp(sampleTime, 0f, Mathf.Max(sampleTime, sourceKeyframes[sourceKeyframes.Count - 1].m_Time));
+        CameraTrajectoryKeyframe previousKeyframe = sourceKeyframes[0];
+        CameraTrajectoryKeyframe nextKeyframe = sourceKeyframes[sourceKeyframes.Count - 1];
+
+        for (int index = 1; index < sourceKeyframes.Count; index++)
+        {
+            CameraTrajectoryKeyframe currentKeyframe = sourceKeyframes[index];
+            if (clampedTime <= currentKeyframe.m_Time)
+            {
+                nextKeyframe = currentKeyframe;
+                break;
+            }
+
+            previousKeyframe = currentKeyframe;
+        }
+
+        if (ReferenceEquals(previousKeyframe, nextKeyframe) || Mathf.Approximately(previousKeyframe.m_Time, nextKeyframe.m_Time))
+        {
+            return CloneTrajectoryKeyframeAtTime(nextKeyframe, sampleTime);
+        }
+
+        float lerpFactor = Mathf.InverseLerp(previousKeyframe.m_Time, nextKeyframe.m_Time, clampedTime);
+        return new CameraTrajectoryKeyframe
+        {
+            m_Time = sampleTime,
+            m_Position = Vector3.LerpUnclamped(previousKeyframe.m_Position, nextKeyframe.m_Position, lerpFactor),
+            m_Rotation = Quaternion.SlerpUnclamped(previousKeyframe.m_Rotation, nextKeyframe.m_Rotation, lerpFactor),
+            m_FieldOfView = Mathf.LerpUnclamped(previousKeyframe.m_FieldOfView, nextKeyframe.m_FieldOfView, lerpFactor),
+            m_IsOrthographic = lerpFactor < 0.5f ? previousKeyframe.m_IsOrthographic : nextKeyframe.m_IsOrthographic,
+            m_OrthographicSize = Mathf.LerpUnclamped(previousKeyframe.m_OrthographicSize, nextKeyframe.m_OrthographicSize, lerpFactor)
+        };
+    }
+
+    /// <summary>
+    /// 复制关键帧并写入新的时间值。
+    /// </summary>
+    /// <param name="sourceKeyframe">源关键帧。</param>
+    /// <param name="time">新时间。</param>
+    /// <returns>复制后的关键帧。</returns>
+    private CameraTrajectoryKeyframe CloneTrajectoryKeyframeAtTime(CameraTrajectoryKeyframe sourceKeyframe, float time)
+    {
+        return new CameraTrajectoryKeyframe
+        {
+            m_Time = time,
+            m_Position = sourceKeyframe.m_Position,
+            m_Rotation = sourceKeyframe.m_Rotation,
+            m_FieldOfView = sourceKeyframe.m_FieldOfView,
+            m_IsOrthographic = sourceKeyframe.m_IsOrthographic,
+            m_OrthographicSize = sourceKeyframe.m_OrthographicSize
+        };
+    }
+
+    /// <summary>
+    /// 关键帧时间比较器，用于保证原始采样和重采样前的时间顺序稳定。
+    /// </summary>
+    /// <param name="left">左关键帧。</param>
+    /// <param name="right">右关键帧。</param>
+    /// <returns>时间比较结果。</returns>
+    private int CompareTrajectoryKeyframeTime(CameraTrajectoryKeyframe left, CameraTrajectoryKeyframe right)
+    {
+        if (left == null && right == null)
+        {
+            return 0;
+        }
+
+        if (left == null)
+        {
+            return -1;
+        }
+
+        if (right == null)
+        {
+            return 1;
+        }
+
+        return left.m_Time.CompareTo(right.m_Time);
+    }
+
+    /// <summary>
+    /// 获取当前录制已经进行的时间，供轨迹采样与回放共用。
+    /// </summary>
+    /// <returns>相对录制起点的秒数。</returns>
+    private float GetCurrentRecordElapsedSeconds()
+    {
+        if (m_RecordCaptureStartTime <= 0d)
+        {
+            return 0f;
+        }
+
+        double elapsedSeconds = EditorApplication.timeSinceStartup - m_RecordCaptureStartTime;
+        return Mathf.Clamp((float)elapsedSeconds, 0f, Mathf.Max(0f, m_ActiveRecordDurationSeconds));
+    }
+
+    /// <summary>
+    /// 获取当前显示在工具窗口中的录制时长。
+    /// 实时录制使用真实经过时间，离线逐帧录制则按已完成的帧编号换算时长，
+    /// 这样用户在两种录制模式下都能看到准确、连续的进度反馈。
+    /// </summary>
+    /// <returns>当前已录制的秒数。</returns>
+    private float GetDisplayedRecordElapsedSeconds()
+    {
+        if (m_IsOfflinePlaybackRecording)
+        {
+            float elapsedSeconds = m_OfflinePlaybackFrameIndex / (float)RecordFrameRate;
+            return Mathf.Clamp(elapsedSeconds, 0f, Mathf.Max(0f, m_ActiveRecordDurationSeconds));
+        }
+
+        return GetCurrentRecordElapsedSeconds();
+    }
+
+    /// <summary>
+    /// 判断最近一次录制缓存是否足够生成可回放的轨迹资产。
+    /// </summary>
+    /// <returns>关键帧数量与持续时间都满足回放要求时返回 true。</returns>
+    private bool HasRecordableTrajectoryCache()
+    {
+        return m_LastRecordedTrajectoryKeyframes.Count >= MinTrajectoryKeyframeCount && m_LastRecordedTrajectoryDuration > 0f;
+    }
+
+    /// <summary>
+    /// 判断预设是否包含可回放轨迹。
+    /// </summary>
+    /// <param name="trajectoryPreset">待检查的轨迹预设。</param>
+    /// <returns>满足回放条件时返回 true。</returns>
+    private bool HasValidTrajectoryPreset(CameraTrajectoryPreset trajectoryPreset)
+    {
+        return trajectoryPreset != null
+            && trajectoryPreset.HasValidData()
+            && trajectoryPreset.Keyframes != null
+            && trajectoryPreset.Keyframes.Count >= MinTrajectoryKeyframeCount
+            && trajectoryPreset.Duration > 0f;
+    }
+
+    /// <summary>
+    /// 检查轨迹预设是否可用于回放；必要时弹窗提示用户修正。
+    /// </summary>
+    /// <param name="trajectoryPreset">用户当前选择的轨迹预设。</param>
+    /// <param name="showDialog">是否在失败时弹出提示窗口。</param>
+    /// <returns>预设可回放时返回 true。</returns>
+    private bool ValidateTrajectoryPreset(CameraTrajectoryPreset trajectoryPreset, bool showDialog)
+    {
+        bool isValid = HasValidTrajectoryPreset(trajectoryPreset);
+        if (!isValid && showDialog)
+        {
+            EditorUtility.DisplayDialog("截图工具", "当前轨迹预设无有效关键帧或时长为 0，无法执行回放录制。", "确定");
+        }
+
+        return isValid;
+    }
+
+    /// <summary>
+    /// 将最近一次录制得到的轨迹缓存保存为可复用的 ScriptableObject 资产。
+    /// 保存成功后会自动回填到“回放预设”栏，便于立刻再次录制。
+    /// </summary>
+    private void SaveLastRecordedTrajectoryPreset()
+    {
+        if (!HasRecordableTrajectoryCache())
+        {
+            EditorUtility.DisplayDialog("截图工具", "当前没有可保存的轨迹缓存，请先完成一次轨迹录制。", "确定");
+            return;
+        }
+
+        string defaultAssetName = $"{m_FilePrefix}_Trajectory_{DateTime.Now:yyyyMMdd_HHmmss}";
+        string assetPath = EditorUtility.SaveFilePanelInProject(
+            "保存相机轨迹预设",
+            defaultAssetName,
+            "asset",
+            "请选择轨迹预设保存位置。");
+        if (string.IsNullOrWhiteSpace(assetPath))
+        {
+            return;
+        }
+
+        CameraTrajectoryPreset trajectoryPreset = CreateInstance<CameraTrajectoryPreset>();
+        trajectoryPreset.SetData(m_LastRecordedTrajectoryCameraName, m_LastRecordedTrajectoryDuration, m_LastRecordedTrajectoryKeyframes);
+        AssetDatabase.CreateAsset(trajectoryPreset, assetPath);
+        AssetDatabase.SaveAssets();
+        AssetDatabase.Refresh();
+        m_SelectedTrajectoryPreset = trajectoryPreset;
+        Debug.Log($"[ScreenshotTool] 已保存相机轨迹预设: {assetPath}");
+    }
+
+    /// <summary>
+    /// 结束轨迹回放并恢复相机录制前的姿态，避免工具修改污染场景编辑状态。
+    /// </summary>
+    private void RestorePlaybackCameraState()
+    {
+        bool needsRestore = m_IsTrajectoryPlaybackActive || m_MovementMode == CameraMovementMode.Rig;
+        if (!needsRestore || m_RecordingCamera == null)
+        {
+            m_ActiveTrajectoryPreset = null;
+            m_IsTrajectoryPlaybackActive = false;
+            return;
+        }
+
+        m_RecordingCamera.transform.SetPositionAndRotation(m_PlaybackRestorePosition, m_PlaybackRestoreRotation);
+        m_RecordingCamera.orthographic = m_PlaybackRestoreOrthographic;
+        if (m_PlaybackRestoreOrthographic)
+        {
+            m_RecordingCamera.orthographicSize = m_PlaybackRestoreOrthographicSize;
+        }
+        else
+        {
+            m_RecordingCamera.fieldOfView = m_PlaybackRestoreFieldOfView;
+        }
+
+        m_ActiveTrajectoryPreset = null;
+        m_IsTrajectoryPlaybackActive = false;
+    }
+
+    private Camera ResolveTargetCamera(bool showErrorDialog)
+    {
+        Camera camera = m_TargetCamera != null ? m_TargetCamera : Camera.main;
+        if (camera == null && showErrorDialog)
+        {
+            EditorUtility.DisplayDialog("截图工具", "未找到可用相机，请先指定目标相机或确保场景中存在 Main Camera。", "确定");
+        }
+
+        return camera;
+    }
+
+    private bool ValidateFfmpegPath(bool requiresAsyncGpuReadback)
+    {
+        if (string.IsNullOrWhiteSpace(m_FfmpegExePath))
+        {
+            EditorUtility.DisplayDialog("截图工具", "请先指定 ffmpeg.exe 的完整路径。", "确定");
+            return false;
+        }
+
+        if (!File.Exists(m_FfmpegExePath))
+        {
+            EditorUtility.DisplayDialog("截图工具", "指定的 ffmpeg.exe 路径不存在，请重新选择。", "确定");
+            return false;
+        }
+
+        if (requiresAsyncGpuReadback && !SystemInfo.supportsAsyncGPUReadback)
+        {
+            EditorUtility.DisplayDialog("截图工具", "当前环境不支持 AsyncGPUReadback，无法使用相机 MP4 录屏。", "确定");
+            return false;
+        }
+
+        return true;
+    }
+
+    private bool IsRecordingActive()
+    {
+        return m_RecordProcess != null && !m_RecordProcess.HasExited;
+    }
+
+    private string BuildFfmpegArguments(int recordWidth, int recordHeight, string outputPath)
+    {
+        string frameRateText = RecordFrameRate.ToString(CultureInfo.InvariantCulture);
+        return string.Format(
+            CultureInfo.InvariantCulture,
+            "-y -f rawvideo -pix_fmt rgba -s {0}x{1} -r {2} -i - -vf \"vflip\" -an -c:v libx264 -preset ultrafast -crf {3} -pix_fmt yuv420p -movflags +faststart {4}",
+            recordWidth,
+            recordHeight,
+            frameRateText,
+            RecordQualityCrf,
+            QuoteArgument(outputPath));
+    }
+
+    /// <summary>
+    /// 获取 ffmpeg 浏览对话框的初始目录。
+    /// 优先使用当前已填写路径所在目录，其次回退到 Program Files，
+    /// 最后回退到用户目录，避免向 OpenFilePanel 传入无效路径导致无法弹窗。
+    /// </summary>
+    private string GetFfmpegBrowseDirectory()
+    {
+        if (!string.IsNullOrWhiteSpace(m_FfmpegExePath))
+        {
+            if (Directory.Exists(m_FfmpegExePath))
+            {
+                return m_FfmpegExePath;
+            }
+
+            string currentDirectory = Path.GetDirectoryName(m_FfmpegExePath);
+            if (!string.IsNullOrWhiteSpace(currentDirectory) && Directory.Exists(currentDirectory))
+            {
+                return currentDirectory;
+            }
+        }
+
+        string programFilesPath = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        if (!string.IsNullOrWhiteSpace(programFilesPath) && Directory.Exists(programFilesPath))
+        {
+            return programFilesPath;
+        }
+
+        string userProfilePath = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (!string.IsNullOrWhiteSpace(userProfilePath) && Directory.Exists(userProfilePath))
+        {
+            return userProfilePath;
+        }
+
+        return Application.dataPath;
+    }
+
+    private int EnsureEvenPositiveSize(int value)
+    {
+        int safeValue = Mathf.Max(2, value);
+        if ((safeValue & 1) != 0)
+        {
+            safeValue += 1;
+        }
+
+        return safeValue;
+    }
+
+    private void OnFfmpegDataReceived(object sender, DataReceivedEventArgs args)
+    {
+        if (!string.IsNullOrWhiteSpace(args.Data))
+        {
+            m_LastRecordLogLine = args.Data;
+        }
+    }
+
+    private void DisposeRecordingProcess(bool forceKill)
+    {
+        StopRecordWriterThread(forceKill);
+
+        if (m_RecordProcess != null)
+        {
+            try
+            {
+                if (forceKill && !m_RecordProcess.HasExited)
+                {
+                    m_RecordProcess.Kill();
+                    m_RecordProcess.WaitForExit(2000);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[ScreenshotTool] 释放 ffmpeg 进程时发生异常: {ex.Message}");
+            }
+            finally
+            {
+                m_RecordProcess.OutputDataReceived -= OnFfmpegDataReceived;
+                m_RecordProcess.ErrorDataReceived -= OnFfmpegDataReceived;
+                m_RecordProcess.Dispose();
+                m_RecordProcess = null;
+            }
+        }
+
+        RestorePlaybackCameraState();
+        CleanupRecordResources();
+        ResetRecordingState();
+    }
+
+    private void StopRecordWriterThread(bool forceKill)
+    {
+        m_RecordWriterRunning = false;
+        m_RecordFrameEvent.Set();
+
+        if (m_RecordWriterThread != null)
+        {
+            try
+            {
+                int waitMilliseconds = forceKill ? 500 : 2000;
+                m_RecordWriterThread.Join(waitMilliseconds);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[ScreenshotTool] 等待录屏写入线程退出时发生异常: {ex.Message}");
+            }
+            finally
+            {
+                m_RecordWriterThread = null;
             }
         }
     }
 
-    private void PrepareRecordingTextureForCurrentSettings()
+    private string CreateOutputPath(string extension)
     {
-        m_RecordingWidth = Mathf.Max(1, m_Width * m_SuperSize);
-        m_RecordingHeight = Mathf.Max(1, m_Height * m_SuperSize);
-        EnsureRecordingTexture();
-    }
-
-    private void EnsureRecordingTexture()
-    {
-        int msaaSamples = m_UseRecordingMsaa ? NormalizeMsaaSampleCount(m_RecordingMsaaSamples, 4) : 1;
-        if (m_RecordingRenderTexture != null &&
-            m_PreparedRecordingWidth == m_RecordingWidth &&
-            m_PreparedRecordingHeight == m_RecordingHeight &&
-            m_PreparedRecordingMsaaSamples == msaaSamples)
-        {
-            return;
-        }
-
-        ReleasePreparedRecordingTexture();
-
-        m_RecordingRenderTexture = new RenderTexture(m_RecordingWidth, m_RecordingHeight, 24, RenderTextureFormat.ARGB32);
-        m_RecordingRenderTexture.antiAliasing = msaaSamples;
-        m_RecordingRenderTexture.Create();
-        m_RecordingReadbackTexture = new RenderTexture(m_RecordingWidth, m_RecordingHeight, 0, RenderTextureFormat.ARGB32);
-        m_RecordingReadbackTexture.antiAliasing = 1;
-        m_RecordingReadbackTexture.Create();
-        m_PreparedRecordingWidth = m_RecordingWidth;
-        m_PreparedRecordingHeight = m_RecordingHeight;
-        m_PreparedRecordingMsaaSamples = msaaSamples;
-        m_RecordingReadbackPrewarmed = false;
-
-        if (SystemInfo.supportsAsyncGPUReadback)
-        {
-            AsyncGPUReadback.Request(m_RecordingReadbackTexture, 0, TextureFormat.RGBA32, _ =>
-            {
-                m_RecordingReadbackPrewarmed = true;
-            });
-        }
-    }
-
-    private void ReleasePreparedRecordingTexture()
-    {
-        if (m_RecordingRenderTexture != null)
-        {
-            AsyncGPUReadback.WaitAllRequests();
-            DestroyImmediate(m_RecordingRenderTexture);
-            m_RecordingRenderTexture = null;
-        }
-
-        if (m_RecordingReadbackTexture != null)
-        {
-            DestroyImmediate(m_RecordingReadbackTexture);
-            m_RecordingReadbackTexture = null;
-        }
-
-        m_PreparedRecordingWidth = 0;
-        m_PreparedRecordingHeight = 0;
-        m_PreparedRecordingMsaaSamples = 0;
-        m_RecordingReadbackPrewarmed = false;
-        m_RecordingCamera = null;
-    }
-
-    private int DrawMsaaPopup(string label, int currentValue)
-    {
-        int index = Array.IndexOf(MsaaSampleOptions, currentValue);
-        if (index < 0)
-        {
-            index = 0;
-        }
-
-        index = EditorGUILayout.Popup(label, index, MsaaSampleOptionLabels);
-        return MsaaSampleOptions[index];
-    }
-
-    private int NormalizeMsaaSampleCount(int value, int fallback)
-    {
-        return Array.IndexOf(MsaaSampleOptions, value) >= 0 ? value : fallback;
-    }
-
-    private void ApplyRecordingQualityOverrides()
-    {
-        if (!m_OverrideUrpQuality || m_HasUrpQualityOverride)
-        {
-            return;
-        }
-
-        UniversalRenderPipelineAsset urpAsset = GraphicsSettings.currentRenderPipeline as UniversalRenderPipelineAsset;
-        if (urpAsset == null)
-        {
-            Debug.LogWarning("[ScreenshotTool] 当前没有可用的 URP Asset，已跳过 URP 录制质量覆盖。");
-            return;
-        }
-
-        m_OverriddenUrpAsset = urpAsset;
-        m_OriginalUrpRenderScale = urpAsset.renderScale;
-        m_OriginalUrpMsaaSamples = urpAsset.msaaSampleCount;
-        m_HasUrpQualityOverride = true;
-
-        urpAsset.renderScale = m_RecordingUrpRenderScale;
-        urpAsset.msaaSampleCount = NormalizeMsaaSampleCount(m_RecordingUrpMsaaSamples, 4);
-    }
-
-    private void RestoreRecordingQualityOverrides()
-    {
-        if (!m_HasUrpQualityOverride || m_OverriddenUrpAsset == null)
-        {
-            m_HasUrpQualityOverride = false;
-            m_OverriddenUrpAsset = null;
-            return;
-        }
-
-        m_OverriddenUrpAsset.renderScale = m_OriginalUrpRenderScale;
-        m_OverriddenUrpAsset.msaaSampleCount = m_OriginalUrpMsaaSamples;
-        m_HasUrpQualityOverride = false;
-        m_OverriddenUrpAsset = null;
-    }
-
-    private void ApplyCameraQualityOverrides(Camera camera)
-    {
-        if (camera == null || m_HasCameraQualityOverride)
-        {
-            return;
-        }
-
-        bool needsCameraMsaa = (m_UseRecordingMsaa && NormalizeMsaaSampleCount(m_RecordingMsaaSamples, 4) > 1) ||
-            (m_OverrideUrpQuality && NormalizeMsaaSampleCount(m_RecordingUrpMsaaSamples, 4) > 1);
-        if (!needsCameraMsaa)
-        {
-            return;
-        }
-
-        m_OverriddenCamera = camera;
-        m_OriginalCameraAllowMsaa = camera.allowMSAA;
-        m_HasCameraQualityOverride = true;
-        camera.allowMSAA = true;
-    }
-
-    private void RestoreCameraQualityOverrides()
-    {
-        if (!m_HasCameraQualityOverride || m_OverriddenCamera == null)
-        {
-            m_HasCameraQualityOverride = false;
-            m_OverriddenCamera = null;
-            return;
-        }
-
-        m_OverriddenCamera.allowMSAA = m_OriginalCameraAllowMsaa;
-        m_HasCameraQualityOverride = false;
-        m_OverriddenCamera = null;
-    }
-
-    private string CreateScreenshotPath()
-    {
-        string outputDirectory = GetOutputDirectory();
-        string safePrefix = GetSafeFilePrefix();
-
-        string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-        string fileName = $"{safePrefix}_{timestamp}.png";
-        return Path.Combine(outputDirectory, fileName);
-    }
-
-    private void CreateVideoPaths(out string frameDirectory, out string videoPath)
-    {
-        string outputDirectory = GetOutputDirectory();
-        string safePrefix = GetSafeFilePrefix();
-        string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
-
-        frameDirectory = Path.Combine(outputDirectory, $"{safePrefix}_{timestamp}_frames");
-        Directory.CreateDirectory(frameDirectory);
-
-        videoPath = Path.Combine(outputDirectory, $"{safePrefix}_{timestamp}.mp4");
-    }
-
-    private string GetOutputDirectory()
-    {
-        string projectRootPath = Directory.GetParent(Application.dataPath)!.FullName;
+        string projectRootPath = Directory.GetParent(Application.dataPath).FullName;
         string safeFolderName = string.IsNullOrWhiteSpace(m_OutputFolderName) ? DefaultFolderName : m_OutputFolderName.Trim();
+        string safePrefix = string.IsNullOrWhiteSpace(m_FilePrefix) ? DefaultFilePrefix : m_FilePrefix.Trim();
+        string safeExtension = extension.Trim().TrimStart('.');
         string outputDirectory = Path.Combine(projectRootPath, safeFolderName);
         if (!Directory.Exists(outputDirectory))
         {
             Directory.CreateDirectory(outputDirectory);
         }
 
-        return outputDirectory;
+        string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        string fileName = $"{safePrefix}_{timestamp}.{safeExtension}";
+        return Path.Combine(outputDirectory, fileName);
     }
 
-    private string GetSafeFilePrefix()
-    {
-        return string.IsNullOrWhiteSpace(m_FilePrefix) ? "Screenshot" : m_FilePrefix.Trim();
-    }
-
-    private string Quote(string value)
+    private string QuoteArgument(string value)
     {
         return $"\"{value.Replace("\"", "\\\"")}\"";
-    }
-
-    private bool SearchAndApplyFfmpegPath(bool showResultDialog)
-    {
-        if (TryResolveFfmpegPath(out string ffmpegPath, out string source))
-        {
-            m_FfmpegPath = ffmpegPath;
-            SavePrefs();
-            Debug.Log($"[ScreenshotTool] 已找到 ffmpeg.exe ({source}): {ffmpegPath}");
-            if (showResultDialog)
-            {
-                EditorUtility.DisplayDialog("截图工具", $"已找到 ffmpeg.exe:\n{ffmpegPath}", "确定");
-            }
-
-            return true;
-        }
-
-        if (showResultDialog)
-        {
-            EditorUtility.DisplayDialog("截图工具", "未找到 ffmpeg.exe。请安装 ffmpeg，或手动指定 ffmpeg.exe 路径。", "确定");
-        }
-
-        return false;
-    }
-
-    private bool TryResolveFfmpegPath(out string ffmpegPath, out string source)
-    {
-        if (IsValidFfmpegPath(m_FfmpegPath))
-        {
-            ffmpegPath = m_FfmpegPath;
-            source = "当前设置";
-            return true;
-        }
-
-        if (TryFindFfmpegInProject(out ffmpegPath))
-        {
-            source = "项目目录";
-            return true;
-        }
-
-        if (TryFindFfmpegInPath(out ffmpegPath))
-        {
-            source = "环境变量 PATH";
-            return true;
-        }
-
-        if (TryFindFfmpegInCommonLocations(out ffmpegPath))
-        {
-            source = "常见安装位置";
-            return true;
-        }
-
-        ffmpegPath = string.Empty;
-        source = string.Empty;
-        return false;
-    }
-
-    private bool IsValidFfmpegPath(string path)
-    {
-        return !string.IsNullOrWhiteSpace(path) &&
-            File.Exists(path) &&
-            string.Equals(Path.GetFileName(path), "ffmpeg.exe", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private bool TryFindFfmpegInProject(out string ffmpegPath)
-    {
-        string projectRootPath = Directory.GetParent(Application.dataPath)!.FullName;
-        return TryFindFileByName(projectRootPath, "ffmpeg.exe", 6, out ffmpegPath);
-    }
-
-    private bool TryFindFfmpegInPath(out string ffmpegPath)
-    {
-        string pathValue = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-        string[] pathEntries = pathValue.Split(Path.PathSeparator);
-        foreach (string pathEntry in pathEntries)
-        {
-            if (string.IsNullOrWhiteSpace(pathEntry))
-            {
-                continue;
-            }
-
-            string candidate = Path.Combine(pathEntry.Trim(), "ffmpeg.exe");
-            if (IsValidFfmpegPath(candidate))
-            {
-                ffmpegPath = candidate;
-                return true;
-            }
-        }
-
-        ffmpegPath = string.Empty;
-        return false;
-    }
-
-    private bool TryFindFfmpegInCommonLocations(out string ffmpegPath)
-    {
-        List<string> roots = new List<string>();
-        AddSearchRoot(roots, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles));
-        AddSearchRoot(roots, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86));
-        AddSearchRoot(roots, Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
-        AddSearchRoot(roots, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
-        AddSearchRoot(roots, Environment.GetEnvironmentVariable("ChocolateyInstall"));
-        AddSearchRoot(roots, Environment.GetEnvironmentVariable("SCOOP"));
-        AddSearchRoot(roots, @"C:\ffmpeg");
-        AddSearchRoot(roots, @"C:\tools");
-
-        foreach (DriveInfo drive in DriveInfo.GetDrives())
-        {
-            if (!drive.IsReady || drive.DriveType != DriveType.Fixed)
-            {
-                continue;
-            }
-
-            AddSearchRoot(roots, Path.Combine(drive.RootDirectory.FullName, "ffmpeg"));
-            AddSearchRoot(roots, Path.Combine(drive.RootDirectory.FullName, "tools"));
-        }
-
-        foreach (string root in roots)
-        {
-            if (TryFindFileByName(root, "ffmpeg.exe", 5, out ffmpegPath))
-            {
-                return true;
-            }
-        }
-
-        ffmpegPath = string.Empty;
-        return false;
-    }
-
-    private void AddSearchRoot(List<string> roots, string root)
-    {
-        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
-        {
-            return;
-        }
-
-        string fullPath = Path.GetFullPath(root);
-        foreach (string existingRoot in roots)
-        {
-            if (string.Equals(existingRoot, fullPath, StringComparison.OrdinalIgnoreCase))
-            {
-                return;
-            }
-        }
-
-        roots.Add(fullPath);
-    }
-
-    private bool TryFindFileByName(string root, string fileName, int maxDepth, out string filePath)
-    {
-        filePath = string.Empty;
-        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
-        {
-            return false;
-        }
-
-        Stack<SearchDirectory> pendingDirectories = new Stack<SearchDirectory>();
-        pendingDirectories.Push(new SearchDirectory(root, 0));
-
-        while (pendingDirectories.Count > 0)
-        {
-            SearchDirectory current = pendingDirectories.Pop();
-            string candidate = Path.Combine(current.Path, fileName);
-            if (IsValidFfmpegPath(candidate))
-            {
-                filePath = candidate;
-                return true;
-            }
-
-            if (current.Depth >= maxDepth)
-            {
-                continue;
-            }
-
-            string[] childDirectories;
-            try
-            {
-                childDirectories = Directory.GetDirectories(current.Path);
-            }
-            catch (Exception)
-            {
-                continue;
-            }
-
-            foreach (string childDirectory in childDirectories)
-            {
-                if (ShouldSkipFfmpegSearchDirectory(childDirectory))
-                {
-                    continue;
-                }
-
-                pendingDirectories.Push(new SearchDirectory(childDirectory, current.Depth + 1));
-            }
-        }
-
-        return false;
-    }
-
-    private bool ShouldSkipFfmpegSearchDirectory(string directoryPath)
-    {
-        string directoryName = Path.GetFileName(directoryPath);
-        return string.Equals(directoryName, ".git", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(directoryName, "Library", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(directoryName, "Temp", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(directoryName, "Obj", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(directoryName, "Build", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(directoryName, "Builds", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(directoryName, "Logs", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private struct SearchDirectory
-    {
-        public readonly string Path;
-        public readonly int Depth;
-
-        public SearchDirectory(string path, int depth)
-        {
-            Path = path;
-            Depth = depth;
-        }
     }
 
     private void LoadPrefs()
     {
         m_OutputFolderName = EditorPrefs.GetString(PrefKeyPrefix + "OutputFolderName", DefaultFolderName);
-        m_FilePrefix = EditorPrefs.GetString(PrefKeyPrefix + "FilePrefix", "Screenshot");
+        m_FilePrefix = EditorPrefs.GetString(PrefKeyPrefix + "FilePrefix", DefaultFilePrefix);
         m_Width = EditorPrefs.GetInt(PrefKeyPrefix + "Width", 1920);
         m_Height = EditorPrefs.GetInt(PrefKeyPrefix + "Height", 1080);
         m_SuperSize = EditorPrefs.GetInt(PrefKeyPrefix + "SuperSize", 1);
         m_RevealInExplorer = EditorPrefs.GetBool(PrefKeyPrefix + "RevealInExplorer", true);
-        m_VideoFps = EditorPrefs.GetInt(PrefKeyPrefix + "VideoFps", DefaultVideoFps);
-        m_VideoFixedDurationEnabled = EditorPrefs.GetBool(PrefKeyPrefix + "VideoFixedDurationEnabled", true);
-        m_VideoDurationSeconds = EditorPrefs.GetFloat(PrefKeyPrefix + "VideoDurationSeconds", DefaultVideoDurationSeconds);
-        m_FfmpegPath = EditorPrefs.GetString(PrefKeyPrefix + "FfmpegPath", string.Empty);
-        m_KeepVideoFrames = EditorPrefs.GetBool(PrefKeyPrefix + "KeepVideoFrames", false);
-        m_UseRecordingMsaa = EditorPrefs.GetBool(PrefKeyPrefix + "UseRecordingMsaa", true);
-        m_RecordingMsaaSamples = NormalizeMsaaSampleCount(EditorPrefs.GetInt(PrefKeyPrefix + "RecordingMsaaSamples", 4), 4);
-        m_OverrideUrpQuality = EditorPrefs.GetBool(PrefKeyPrefix + "OverrideUrpQuality", false);
-        m_RecordingUrpRenderScale = Mathf.Clamp(EditorPrefs.GetFloat(PrefKeyPrefix + "RecordingUrpRenderScale", 1.25f), 0.5f, 2f);
-        m_RecordingUrpMsaaSamples = NormalizeMsaaSampleCount(EditorPrefs.GetInt(PrefKeyPrefix + "RecordingUrpMsaaSamples", 4), 4);
-        m_UseHighQualityEncoding = EditorPrefs.GetBool(PrefKeyPrefix + "UseHighQualityEncoding", true);
-        m_VideoCrf = Mathf.Clamp(EditorPrefs.GetInt(PrefKeyPrefix + "VideoCrf", 16), 12, 28);
-        m_FfmpegPreset = EditorPrefs.GetString(PrefKeyPrefix + "FfmpegPreset", "slow");
-        m_MaxPendingReadbackFrames = Mathf.Clamp(EditorPrefs.GetInt(PrefKeyPrefix + "MaxPendingReadbackFrames", 2), 1, 8);
-        if (Array.IndexOf(FfmpegPresetOptions, m_FfmpegPreset) < 0)
+        m_FfmpegExePath = EditorPrefs.GetString(PrefKeyPrefix + "FfmpegExePath", string.Empty);
+        m_RecordDurationSeconds = EditorPrefs.GetFloat(PrefKeyPrefix + "RecordDurationSeconds", 10f);
+        m_RecordDelaySeconds = EditorPrefs.GetFloat(PrefKeyPrefix + "RecordDelaySeconds", 0f);
+        m_RecordWidth = EnsureEvenPositiveSize(EditorPrefs.GetInt(PrefKeyPrefix + "RecordWidth", 1920));
+        m_RecordHeight = EnsureEvenPositiveSize(EditorPrefs.GetInt(PrefKeyPrefix + "RecordHeight", 1080));
+        m_RecordCameraTrajectory = EditorPrefs.GetBool(PrefKeyPrefix + "RecordCameraTrajectory", true);
+
+        // 机位配置
+        m_MovementMode = (CameraMovementMode)EditorPrefs.GetInt(PrefKeyPrefix + "MovementMode", (int)CameraMovementMode.Trajectory);
+        m_RigSmoothTime = EditorPrefs.GetFloat(PrefKeyPrefix + "RigSmoothTime", 2f);
+        m_RigMaxSpeed = EditorPrefs.GetFloat(PrefKeyPrefix + "RigMaxSpeed", float.PositiveInfinity);
+        m_RigLookAtTarget = RestoreTransformByInstanceID(EditorPrefs.GetInt(PrefKeyPrefix + "RigLookAtTargetID", 0));
+        int waypointCount = EditorPrefs.GetInt(PrefKeyPrefix + "RigWaypointCount", DefaultRigWaypointCount);
+        m_RigWaypoints = new List<Transform>(new Transform[Mathf.Max(2, waypointCount)]);
+        for (int i = 0; i < m_RigWaypoints.Count; i++)
         {
-            m_FfmpegPreset = "slow";
+            m_RigWaypoints[i] = RestoreTransformByInstanceID(EditorPrefs.GetInt(PrefKeyPrefix + "RigWaypoint" + i + "ID", 0));
         }
     }
 
@@ -1260,19 +1926,32 @@ public class ScreenshotToolWindow : EditorWindow
         EditorPrefs.SetInt(PrefKeyPrefix + "Height", m_Height);
         EditorPrefs.SetInt(PrefKeyPrefix + "SuperSize", m_SuperSize);
         EditorPrefs.SetBool(PrefKeyPrefix + "RevealInExplorer", m_RevealInExplorer);
-        EditorPrefs.SetInt(PrefKeyPrefix + "VideoFps", m_VideoFps);
-        EditorPrefs.SetBool(PrefKeyPrefix + "VideoFixedDurationEnabled", m_VideoFixedDurationEnabled);
-        EditorPrefs.SetFloat(PrefKeyPrefix + "VideoDurationSeconds", m_VideoDurationSeconds);
-        EditorPrefs.SetString(PrefKeyPrefix + "FfmpegPath", m_FfmpegPath);
-        EditorPrefs.SetBool(PrefKeyPrefix + "KeepVideoFrames", m_KeepVideoFrames);
-        EditorPrefs.SetBool(PrefKeyPrefix + "UseRecordingMsaa", m_UseRecordingMsaa);
-        EditorPrefs.SetInt(PrefKeyPrefix + "RecordingMsaaSamples", m_RecordingMsaaSamples);
-        EditorPrefs.SetBool(PrefKeyPrefix + "OverrideUrpQuality", m_OverrideUrpQuality);
-        EditorPrefs.SetFloat(PrefKeyPrefix + "RecordingUrpRenderScale", m_RecordingUrpRenderScale);
-        EditorPrefs.SetInt(PrefKeyPrefix + "RecordingUrpMsaaSamples", m_RecordingUrpMsaaSamples);
-        EditorPrefs.SetBool(PrefKeyPrefix + "UseHighQualityEncoding", m_UseHighQualityEncoding);
-        EditorPrefs.SetInt(PrefKeyPrefix + "VideoCrf", m_VideoCrf);
-        EditorPrefs.SetString(PrefKeyPrefix + "FfmpegPreset", m_FfmpegPreset);
-        EditorPrefs.SetInt(PrefKeyPrefix + "MaxPendingReadbackFrames", m_MaxPendingReadbackFrames);
+        EditorPrefs.SetString(PrefKeyPrefix + "FfmpegExePath", m_FfmpegExePath);
+        EditorPrefs.SetFloat(PrefKeyPrefix + "RecordDurationSeconds", Mathf.Max(1f, m_RecordDurationSeconds));
+        EditorPrefs.SetFloat(PrefKeyPrefix + "RecordDelaySeconds", Mathf.Max(0f, m_RecordDelaySeconds));
+        EditorPrefs.SetInt(PrefKeyPrefix + "RecordWidth", EnsureEvenPositiveSize(m_RecordWidth));
+        EditorPrefs.SetInt(PrefKeyPrefix + "RecordHeight", EnsureEvenPositiveSize(m_RecordHeight));
+        EditorPrefs.SetBool(PrefKeyPrefix + "RecordCameraTrajectory", m_RecordCameraTrajectory);
+
+        // 机位配置
+        EditorPrefs.SetInt(PrefKeyPrefix + "MovementMode", (int)m_MovementMode);
+        EditorPrefs.SetFloat(PrefKeyPrefix + "RigSmoothTime", m_RigSmoothTime);
+        EditorPrefs.SetFloat(PrefKeyPrefix + "RigMaxSpeed", m_RigMaxSpeed);
+        EditorPrefs.SetInt(PrefKeyPrefix + "RigLookAtTargetID", m_RigLookAtTarget != null ? m_RigLookAtTarget.GetInstanceID() : 0);
+        EditorPrefs.SetInt(PrefKeyPrefix + "RigWaypointCount", m_RigWaypoints.Count);
+        for (int i = 0; i < m_RigWaypoints.Count; i++)
+        {
+            int instanceID = m_RigWaypoints[i] != null ? m_RigWaypoints[i].GetInstanceID() : 0;
+            EditorPrefs.SetInt(PrefKeyPrefix + "RigWaypoint" + i + "ID", instanceID);
+        }
+    }
+    private static Transform RestoreTransformByInstanceID(int instanceID)
+    {
+        if (instanceID == 0)
+        {
+            return null;
+        }
+        UnityEngine.Object obj = EditorUtility.InstanceIDToObject(instanceID);
+        return obj as Transform;
     }
 }
