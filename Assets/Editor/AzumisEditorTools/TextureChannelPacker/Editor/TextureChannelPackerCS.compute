@@ -2,12 +2,15 @@
 // Texture Channel Packer Compute Shader
 // 
 // 文件名称: TextureChannelPackerCS.compute
-// 版本: 1.0
+// 版本: 1.3
 // 
 // 描述: 用于纹理通道提取和重新打包的Compute Shader
 // 
 // 修改历史:
 // 2026-03-20 - 初始版本
+// 2026-07-07 - 修复线性采样不稳定导致的缩放像素感问题
+// 2026-07-07 - 提取 Alpha 时改为按像素读取原始值，避免额外采样误差
+// 2026-07-20 - 新增 1-R/1-G/1-B/1-A 反相通道采样
 // ================================================================
 
 #pragma kernel ExtractChannel
@@ -16,12 +19,28 @@
 // 提取通道相关参数
 Texture2D<float4> SourceTexture;
 RWTexture2D<float4> ExtractedResult;
-int SourceChannelIndex; // 0:R, 1:G, 2:B, 3:A
+int SourceChannelIndex; // 0:R, 1:G, 2:B, 3:A, 6:1-R, 7:1-G, 8:1-B, 9:1-A
 int OutputWidth;
 int OutputHeight;
 
-// 定义双线性采样
-SamplerState LinearClampSampler;
+// 强制使用线性 Clamp 采样，避免不同尺寸纹理在放大时出现明显像素感。
+SamplerState sampler_linear_clamp;
+
+float GetSourceChannelValue(Texture2D<float4> tex, float2 uv, uint2 pixelCoord, int channelIndex)
+{
+    float4 sampledColor = tex.SampleLevel(sampler_linear_clamp, uv, 0);
+
+    if (channelIndex == 0) return sampledColor.r;
+    if (channelIndex == 1) return sampledColor.g;
+    if (channelIndex == 2) return sampledColor.b;
+    if (channelIndex == 3) return tex.Load(int3(pixelCoord, 0)).a;
+    if (channelIndex == 6) return 1.0 - sampledColor.r;
+    if (channelIndex == 7) return 1.0 - sampledColor.g;
+    if (channelIndex == 8) return 1.0 - sampledColor.b;
+    if (channelIndex == 9) return 1.0 - tex.Load(int3(pixelCoord, 0)).a;
+
+    return 0.0;
+}
 
 [numthreads(8, 8, 1)]
 void ExtractChannel (uint3 id : SV_DispatchThreadID)
@@ -32,13 +51,7 @@ void ExtractChannel (uint3 id : SV_DispatchThreadID)
     float2 uv = float2((id.x + 0.5) / (float)OutputWidth, (id.y + 0.5) / (float)OutputHeight);
     
     // 从源纹理采样
-    float4 srcColor = SourceTexture.SampleLevel(LinearClampSampler, uv, 0);
-    
-    float val = 0;
-    if(SourceChannelIndex == 0) val = srcColor.r;
-    else if(SourceChannelIndex == 1) val = srcColor.g;
-    else if(SourceChannelIndex == 2) val = srcColor.b;
-    else if(SourceChannelIndex == 3) val = srcColor.a;
+    float val = GetSourceChannelValue(SourceTexture, uv, id.xy, SourceChannelIndex);
 
     // 输出为灰度图，RGB相同，A为1
     ExtractedResult[id.xy] = float4(val, val, val, 1.0);
@@ -51,7 +64,7 @@ Texture2D<float4> TexB;
 Texture2D<float4> TexA;
 RWTexture2D<float4> PackedResult;
 
-// 0:R, 1:G, 2:B, 3:A, 4:Black, 5:White
+// 0:R, 1:G, 2:B, 3:A, 4:Black, 5:White, 6:1-R, 7:1-G, 8:1-B, 9:1-A
 int SourceChannelForR;
 int SourceChannelForG;
 int SourceChannelForB;
@@ -61,13 +74,17 @@ float GetChannelValue(Texture2D<float4> tex, float2 uv, int channelIndex)
 {
     if(channelIndex == 4) return 0.0;
     if(channelIndex == 5) return 1.0;
-    
-    float4 col = tex.SampleLevel(LinearClampSampler, uv, 0);
-    
+
+    float4 col = tex.SampleLevel(sampler_linear_clamp, uv, 0);
+
     if(channelIndex == 0) return col.r;
     if(channelIndex == 1) return col.g;
     if(channelIndex == 2) return col.b;
     if(channelIndex == 3) return col.a;
+    if(channelIndex == 6) return 1.0 - col.r;
+    if(channelIndex == 7) return 1.0 - col.g;
+    if(channelIndex == 8) return 1.0 - col.b;
+    if(channelIndex == 9) return 1.0 - col.a;
     
     return 0.0;
 }
