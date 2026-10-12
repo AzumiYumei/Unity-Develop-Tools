@@ -1,3 +1,17 @@
+// ================================================================
+// SDF 纹理生成器窗口
+//
+// 文件名称: SdfTextureGeneratorWindow.cs
+// 版本: 1.2
+//
+// 描述: 在 Unity 编辑器中生成用于着色器采样的 SDF 纹理，
+//       并在导出时自动设置更适合 SDF 的贴图导入参数。
+//
+// 修改历史:
+// 2026-06-03 - 1.0 初始版本
+// 2026-06-03 - 1.1 优化 SDF 导出质量并补充导入设置
+// 2026-06-03 - 1.2 支持高倍率输出与高精度导出，进一步降低像素感
+// ================================================================
 using System.IO;
 using UnityEditor;
 using UnityEngine;
@@ -11,6 +25,8 @@ namespace AzumisEditorTools.SdfGenerator
         private const string PrefKeyThreshold = "Azumi_SdfGenerator_Threshold";
         private const string PrefKeyUseGreenChannel = "Azumi_SdfGenerator_UseGreenChannel";
         private const string PrefKeySpreadPixels = "Azumi_SdfGenerator_SpreadPixels";
+        private const string PrefKeyOutputScale = "Azumi_SdfGenerator_OutputScale";
+        private const string PrefKeyHighPrecisionExport = "Azumi_SdfGenerator_HighPrecisionExport";
         private const string PrefKeyInvert = "Azumi_SdfGenerator_Invert";
 
         private Texture2D m_SourceTexture;
@@ -18,6 +34,8 @@ namespace AzumisEditorTools.SdfGenerator
         private int m_Threshold = 100;
         private bool m_UseGreenChannel = true;
         private float m_SpreadPixels = 24f;
+        private int m_OutputScale = 4;
+        private bool m_HighPrecisionExport = true;
         private bool m_Invert;
         private Texture2D m_SdfPreviewTexture;
         private ComputeShader m_ComputeShader;
@@ -37,6 +55,8 @@ namespace AzumisEditorTools.SdfGenerator
             m_Threshold = EditorPrefs.GetInt(PrefKeyThreshold, 100);
             m_UseGreenChannel = EditorPrefs.GetBool(PrefKeyUseGreenChannel, true);
             m_SpreadPixels = EditorPrefs.GetFloat(PrefKeySpreadPixels, 24f);
+            m_OutputScale = EditorPrefs.GetInt(PrefKeyOutputScale, 4);
+            m_HighPrecisionExport = EditorPrefs.GetBool(PrefKeyHighPrecisionExport, true);
             m_Invert = EditorPrefs.GetBool(PrefKeyInvert, false);
             LoadComputeShader();
         }
@@ -47,6 +67,8 @@ namespace AzumisEditorTools.SdfGenerator
             EditorPrefs.SetInt(PrefKeyThreshold, m_Threshold);
             EditorPrefs.SetBool(PrefKeyUseGreenChannel, m_UseGreenChannel);
             EditorPrefs.SetFloat(PrefKeySpreadPixels, m_SpreadPixels);
+            EditorPrefs.SetInt(PrefKeyOutputScale, m_OutputScale);
+            EditorPrefs.SetBool(PrefKeyHighPrecisionExport, m_HighPrecisionExport);
             EditorPrefs.SetBool(PrefKeyInvert, m_Invert);
             if (m_SdfPreviewTexture != null)
             {
@@ -71,6 +93,8 @@ namespace AzumisEditorTools.SdfGenerator
             m_Threshold = EditorGUILayout.IntSlider("白色阈值", m_Threshold, 0, 255);
             m_UseGreenChannel = EditorGUILayout.Toggle("使用G通道判定", m_UseGreenChannel);
             m_SpreadPixels = EditorGUILayout.Slider("SDF扩散像素", m_SpreadPixels, 1f, 256f);
+            m_OutputScale = EditorGUILayout.IntSlider("输出倍率", m_OutputScale, 1, 8);
+            m_HighPrecisionExport = EditorGUILayout.Toggle("高精度EXR导出", m_HighPrecisionExport);
             m_Invert = EditorGUILayout.Toggle("反转输出", m_Invert);
 
             EditorGUILayout.Space(8f);
@@ -172,8 +196,11 @@ namespace AzumisEditorTools.SdfGenerator
                 return;
             }
 
-            int width = m_SourceTexture.width;
-            int height = m_SourceTexture.height;
+            int sourceWidth = m_SourceTexture.width;
+            int sourceHeight = m_SourceTexture.height;
+            int outputWidth = sourceWidth * Mathf.Max(1, m_OutputScale);
+            int outputHeight = sourceHeight * Mathf.Max(1, m_OutputScale);
+            float scaledSpreadPixels = Mathf.Max(1f, m_SpreadPixels * Mathf.Max(1, m_OutputScale));
 
             RenderTexture insideA = null;
             RenderTexture insideB = null;
@@ -183,18 +210,18 @@ namespace AzumisEditorTools.SdfGenerator
 
             try
             {
-                insideA = CreateSeedRenderTexture(width, height);
-                insideB = CreateSeedRenderTexture(width, height);
-                outsideA = CreateSeedRenderTexture(width, height);
-                outsideB = CreateSeedRenderTexture(width, height);
-                sdfOutput = CreateOutputRenderTexture(width, height);
+                insideA = CreateSeedRenderTexture(outputWidth, outputHeight);
+                insideB = CreateSeedRenderTexture(outputWidth, outputHeight);
+                outsideA = CreateSeedRenderTexture(outputWidth, outputHeight);
+                outsideB = CreateSeedRenderTexture(outputWidth, outputHeight);
+                sdfOutput = CreateOutputRenderTexture(outputWidth, outputHeight);
 
-                DispatchInitSeeds(width, height, m_SourceTexture, insideA, outsideA);
-                RunJumpFlood(width, height, ref insideA, ref insideB);
-                RunJumpFlood(width, height, ref outsideA, ref outsideB);
-                DispatchCompose(width, height, insideA, outsideA, sdfOutput);
+                DispatchInitSeeds(outputWidth, outputHeight, sourceWidth, sourceHeight, m_SourceTexture, insideA, outsideA);
+                RunJumpFlood(outputWidth, outputHeight, ref insideA, ref insideB);
+                RunJumpFlood(outputWidth, outputHeight, ref outsideA, ref outsideB);
+                DispatchCompose(outputWidth, outputHeight, sourceWidth, sourceHeight, m_SourceTexture, insideA, outsideA, sdfOutput, scaledSpreadPixels);
 
-                Texture2D sdfTexture = ReadRenderTextureToTexture2D(sdfOutput, m_SourceTexture.name + "_SDF_Preview");
+                Texture2D sdfTexture = ReadRenderTextureToTexture2D(sdfOutput, m_SourceTexture.name + "_SDF_Preview", TextureFormat.RGBA32);
                 if (m_SdfPreviewTexture != null)
                 {
                     DestroyImmediate(m_SdfPreviewTexture);
@@ -214,11 +241,15 @@ namespace AzumisEditorTools.SdfGenerator
                 }
 
                 string sourceName = Path.GetFileNameWithoutExtension(sourcePath);
-                string savePath = AssetDatabase.GenerateUniqueAssetPath(Path.Combine(m_OutputFolder, sourceName + "_SDF.png").Replace("\\", "/"));
-                byte[] png = sdfTexture.EncodeToPNG();
-                File.WriteAllBytes(savePath, png);
-                AssetDatabase.ImportAsset(savePath);
-                AssetDatabase.Refresh();
+                string extension = m_HighPrecisionExport ? ".exr" : ".png";
+                string savePath = AssetDatabase.GenerateUniqueAssetPath(Path.Combine(m_OutputFolder, sourceName + "_SDF" + extension).Replace("\\", "/"));
+                TextureFormat exportFormat = m_HighPrecisionExport ? TextureFormat.RGBAHalf : TextureFormat.RGBA32;
+                Texture2D exportTexture = ReadRenderTextureToTexture2D(sdfOutput, m_SourceTexture.name + "_SDF_Export", exportFormat);
+                byte[] outputBytes = m_HighPrecisionExport ? exportTexture.EncodeToEXR(Texture2D.EXRFlags.CompressZIP) : exportTexture.EncodeToPNG();
+                File.WriteAllBytes(savePath, outputBytes);
+                DestroyImmediate(exportTexture);
+                AssetDatabase.ImportAsset(savePath, ImportAssetOptions.ForceUpdate);
+                ApplySdfTextureImportSettings(savePath);
                 Selection.activeObject = AssetDatabase.LoadAssetAtPath<Texture2D>(savePath);
                 EditorUtility.DisplayDialog("完成", "SDF 纹理已生成：\n" + savePath, "确定");
             }
@@ -232,11 +263,13 @@ namespace AzumisEditorTools.SdfGenerator
             }
         }
 
-        private void DispatchInitSeeds(int width, int height, Texture2D sourceTexture, RenderTexture insideSeed, RenderTexture outsideSeed)
+        private void DispatchInitSeeds(int width, int height, int sourceWidth, int sourceHeight, Texture2D sourceTexture, RenderTexture insideSeed, RenderTexture outsideSeed)
         {
             int kernel = m_ComputeShader.FindKernel("InitSeeds");
             m_ComputeShader.SetInt("TextureWidth", width);
             m_ComputeShader.SetInt("TextureHeight", height);
+            m_ComputeShader.SetInt("SourceWidth", sourceWidth);
+            m_ComputeShader.SetInt("SourceHeight", sourceHeight);
             m_ComputeShader.SetInt("Threshold", m_Threshold);
             m_ComputeShader.SetInt("UseGreenChannel", m_UseGreenChannel ? 1 : 0);
             m_ComputeShader.SetTexture(kernel, "SourceTexture", sourceTexture);
@@ -266,13 +299,18 @@ namespace AzumisEditorTools.SdfGenerator
             }
         }
 
-        private void DispatchCompose(int width, int height, RenderTexture finalInsideSeed, RenderTexture finalOutsideSeed, RenderTexture output)
+        private void DispatchCompose(int width, int height, int sourceWidth, int sourceHeight, Texture2D sourceTexture, RenderTexture finalInsideSeed, RenderTexture finalOutsideSeed, RenderTexture output, float scaledSpreadPixels)
         {
             int kernel = m_ComputeShader.FindKernel("ComposeSdf");
             m_ComputeShader.SetInt("TextureWidth", width);
             m_ComputeShader.SetInt("TextureHeight", height);
-            m_ComputeShader.SetFloat("SdfSpreadPixels", Mathf.Max(1f, m_SpreadPixels));
+            m_ComputeShader.SetInt("SourceWidth", sourceWidth);
+            m_ComputeShader.SetInt("SourceHeight", sourceHeight);
+            m_ComputeShader.SetInt("Threshold", m_Threshold);
+            m_ComputeShader.SetInt("UseGreenChannel", m_UseGreenChannel ? 1 : 0);
+            m_ComputeShader.SetFloat("SdfSpreadPixels", Mathf.Max(1f, scaledSpreadPixels));
             m_ComputeShader.SetInt("Invert", m_Invert ? 1 : 0);
+            m_ComputeShader.SetTexture(kernel, "SourceTexture", sourceTexture);
             m_ComputeShader.SetTexture(kernel, "FinalSeedInsideTex", finalInsideSeed);
             m_ComputeShader.SetTexture(kernel, "FinalSeedOutsideTex", finalOutsideSeed);
             m_ComputeShader.SetTexture(kernel, "SdfOutputTex", output);
@@ -309,7 +347,7 @@ namespace AzumisEditorTools.SdfGenerator
 
         private RenderTexture CreateOutputRenderTexture(int width, int height)
         {
-            RenderTexture rt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+            RenderTexture rt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGBHalf, RenderTextureReadWrite.Linear);
             rt.enableRandomWrite = true;
             rt.wrapMode = TextureWrapMode.Clamp;
             rt.filterMode = FilterMode.Bilinear;
@@ -332,18 +370,44 @@ namespace AzumisEditorTools.SdfGenerator
             rt = null;
         }
 
-        private Texture2D ReadRenderTextureToTexture2D(RenderTexture rt, string textureName)
+        private Texture2D ReadRenderTextureToTexture2D(RenderTexture rt, string textureName, TextureFormat textureFormat)
         {
             RenderTexture old = RenderTexture.active;
             RenderTexture.active = rt;
-            Texture2D tex = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false, true)
+            Texture2D tex = new Texture2D(rt.width, rt.height, textureFormat, false, true)
             {
                 name = textureName
             };
             tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0, false);
             tex.Apply(false, false);
+            tex.wrapMode = TextureWrapMode.Clamp;
+            tex.filterMode = FilterMode.Bilinear;
             RenderTexture.active = old;
             return tex;
+        }
+
+        /// <summary>
+        /// 为导出的 SDF 纹理应用更稳定的导入设置，避免压缩、mipmap 和 sRGB
+        /// 破坏距离场梯度，导致窄高光带出现明显台阶。
+        /// </summary>
+        /// <param name="assetPath">项目内的纹理资源路径。</param>
+        private void ApplySdfTextureImportSettings(string assetPath)
+        {
+            TextureImporter textureImporter = AssetImporter.GetAtPath(assetPath) as TextureImporter;
+            if (textureImporter == null)
+            {
+                return;
+            }
+
+            textureImporter.textureType = TextureImporterType.Default;
+            textureImporter.textureCompression = TextureImporterCompression.Uncompressed;
+            textureImporter.filterMode = FilterMode.Bilinear;
+            textureImporter.wrapMode = TextureWrapMode.Clamp;
+            textureImporter.mipmapEnabled = false;
+            textureImporter.sRGBTexture = false;
+            textureImporter.alphaSource = TextureImporterAlphaSource.None;
+            textureImporter.npotScale = TextureImporterNPOTScale.None;
+            textureImporter.SaveAndReimport();
         }
     }
 }

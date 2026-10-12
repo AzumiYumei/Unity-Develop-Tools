@@ -15,6 +15,8 @@ RWTexture2D<float4> SdfOutputTex;
 
 int TextureWidth;
 int TextureHeight;
+int SourceWidth;
+int SourceHeight;
 int Threshold;
 int UseGreenChannel;
 int JumpStep;
@@ -23,20 +25,116 @@ int Invert;
 
 static const float InvalidSeed = -65535.0;
 
+float2 PixelCenter(int2 uv)
+{
+    return float2((float)uv.x + 0.5, (float)uv.y + 0.5);
+}
+
+int2 ClampSourcePixel(int2 uv)
+{
+    return int2(clamp(uv.x, 0, SourceWidth - 1), clamp(uv.y, 0, SourceHeight - 1));
+}
+
+float SampleSourceMask(int2 sourceUv)
+{
+    float4 c = SourceTexture.Load(int3(ClampSourcePixel(sourceUv), 0));
+    return UseGreenChannel == 1 ? c.g : (c.r + c.g + c.b) / 3.0;
+}
+
+float SampleSourceMaskBilinear(float2 sourcePixelPos)
+{
+    int2 basePixel = int2(floor(sourcePixelPos));
+    float2 fracPart = frac(sourcePixelPos);
+
+    float s00 = SampleSourceMask(basePixel);
+    float s10 = SampleSourceMask(basePixel + int2(1, 0));
+    float s01 = SampleSourceMask(basePixel + int2(0, 1));
+    float s11 = SampleSourceMask(basePixel + int2(1, 1));
+
+    float sx0 = lerp(s00, s10, fracPart.x);
+    float sx1 = lerp(s01, s11, fracPart.x);
+    return lerp(sx0, sx1, fracPart.y);
+}
+
 bool IsInside(int2 uv)
 {
-    float4 c = SourceTexture.Load(int3(uv, 0));
-    float v = UseGreenChannel == 1 ? c.g : (c.r + c.g + c.b) / 3.0;
+    float2 sourcePixelPos = PixelCenter(uv) / float2((float)TextureWidth, (float)TextureHeight) * float2((float)SourceWidth, (float)SourceHeight) - 0.5;
+    float v = SampleSourceMaskBilinear(sourcePixelPos);
     return v * 255.0 > (float)Threshold;
 }
 
-float4 EncodeSeed(bool valid, int2 pos)
+float4 EncodeSeed(bool valid, float2 pos)
 {
     if (!valid)
     {
         return float4(InvalidSeed, InvalidSeed, 0.0, 0.0);
     }
-    return float4((float)pos.x, (float)pos.y, 1.0, 0.0);
+    return float4(pos.x, pos.y, 1.0, 0.0);
+}
+
+// 只为轮廓边界像素创建种子，并把种子位置推到亚像素边界处，
+// 这样生成的距离场在窄 smoothstep 过渡下会更平滑。
+bool TryEstimateBoundaryPosition(int2 uv, bool currentInside, out float2 boundaryPos)
+{
+    float2 directionSum = 0.0;
+    bool hasOppositeNeighbor = false;
+
+    [unroll]
+    for (int oy = -1; oy <= 1; oy++)
+    {
+        [unroll]
+        for (int ox = -1; ox <= 1; ox++)
+        {
+            if (ox == 0 && oy == 0)
+            {
+                continue;
+            }
+
+            int2 np = uv + int2(ox, oy);
+            bool inBounds = np.x >= 0 && np.x < TextureWidth && np.y >= 0 && np.y < TextureHeight;
+            bool neighborInside = inBounds ? IsInside(np) : false;
+            if (neighborInside == currentInside)
+            {
+                continue;
+            }
+
+            float2 direction = float2((float)ox, (float)oy);
+            directionSum += direction / max(length(direction), 1.0);
+            hasOppositeNeighbor = true;
+        }
+    }
+
+    if (!hasOppositeNeighbor)
+    {
+        boundaryPos = 0.0;
+        return false;
+    }
+
+    float directionLength = length(directionSum);
+    if (directionLength <= 0.0001)
+    {
+        boundaryPos = PixelCenter(uv);
+        return true;
+    }
+
+    boundaryPos = PixelCenter(uv) + directionSum / directionLength * 0.5;
+    return true;
+}
+
+float4 CreateBoundarySeed(int2 uv, bool currentInside, bool targetInside)
+{
+    if (currentInside != targetInside)
+    {
+        return EncodeSeed(false, float2(0.0, 0.0));
+    }
+
+    float2 boundaryPos;
+    if (!TryEstimateBoundaryPosition(uv, currentInside, boundaryPos))
+    {
+        return EncodeSeed(false, float2(0.0, 0.0));
+    }
+
+    return EncodeSeed(true, boundaryPos);
 }
 
 bool IsValidSeed(float4 seed)
@@ -46,7 +144,7 @@ bool IsValidSeed(float4 seed)
 
 float SeedDistSq(float4 seed, int2 p)
 {
-    float2 d = seed.xy - float2((float)p.x, (float)p.y);
+    float2 d = seed.xy - PixelCenter(p);
     return dot(d, d);
 }
 
@@ -61,8 +159,8 @@ void InitSeeds(uint3 id : SV_DispatchThreadID)
 
     bool inside = IsInside(p);
 
-    SeedInsideTex[p] = EncodeSeed(inside, p);
-    SeedOutsideTex[p] = EncodeSeed(!inside, p);
+    SeedInsideTex[p] = CreateBoundarySeed(p, inside, true);
+    SeedOutsideTex[p] = CreateBoundarySeed(p, inside, false);
 }
 
 [numthreads(8, 8, 1)]
@@ -121,7 +219,8 @@ void ComposeSdf(uint3 id : SV_DispatchThreadID)
 
     float dIn = IsValidSeed(inSeed) ? sqrt(SeedDistSq(inSeed, p)) : SdfSpreadPixels;
     float dOut = IsValidSeed(outSeed) ? sqrt(SeedDistSq(outSeed, p)) : SdfSpreadPixels;
-    float signedDist = dOut - dIn;
+    bool inside = IsInside(p);
+    float signedDist = inside ? dIn : -dOut;
 
     float normalized = 0.5 + signedDist / max(1.0, SdfSpreadPixels) * 0.5;
     normalized = saturate(normalized);
