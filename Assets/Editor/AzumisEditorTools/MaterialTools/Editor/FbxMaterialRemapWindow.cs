@@ -41,6 +41,9 @@ namespace AzumisEditorTools
         {
             public Material m_SourceMaterial;
             public Material m_TargetMaterial;
+            public string m_SourceDisplayName = string.Empty;
+            public string m_FbxMaterialLookupKey = string.Empty;
+            public bool m_HasFbxMaterialLookupKeyConflict;
             public int m_UsageCount;
             public bool m_IsExpanded;
             public readonly List<PrefabRendererUsageEntry> m_RendererUsages = new List<PrefabRendererUsageEntry>();
@@ -52,35 +55,29 @@ namespace AzumisEditorTools
             public string m_RelativeRendererPath = string.Empty;
         }
 
-        [Serializable]
-        private sealed class MaterialTargetState
+        private sealed class OriginalRendererMaterialState
         {
-            public string m_SourceKey = string.Empty;
-            public string m_TargetPath = string.Empty;
-            public string m_TargetName = string.Empty;
+            public Material[] m_OriginalMaterials = Array.Empty<Material>();
+            public string[] m_OriginalMaterialNames = Array.Empty<string>();
         }
 
-        [Serializable]
-        private sealed class WindowState
+        private sealed class OriginalFbxRendererStateMap
         {
-            public string m_FbxAssetPath = string.Empty;
-            public int m_MaterialSearchMode;
-            public string m_SearchFolderPath = string.Empty;
-            public string m_PrefabAssetPath = string.Empty;
-            public string m_PrefabSearchFolderPath = string.Empty;
-            public bool m_IsFbxResultsExpanded;
-            public bool m_IsPrefabResultsExpanded;
-            public Vector2 m_ScrollPosition;
-            public List<MaterialTargetState> m_FbxTargets = new List<MaterialTargetState>();
-            public List<MaterialTargetState> m_PrefabTargets = new List<MaterialTargetState>();
+            public readonly Dictionary<string, OriginalRendererMaterialState> m_RendererStateByPath = new Dictionary<string, OriginalRendererMaterialState>(StringComparer.OrdinalIgnoreCase);
         }
 
-        private const string m_WindowStateEditorPrefsKey = "AzumisEditorTools.FbxMaterialRemapWindow.State";
+        private sealed class OriginalFbxMaterialNameLookup
+        {
+            public readonly Dictionary<int, string> m_NameByMaterialId = new Dictionary<int, string>();
+            public readonly Dictionary<string, string> m_NameByMaterialName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+
         private const string m_WindowTitle = "FBX 材质映射";
 
         private GameObject m_FbxAsset;
         private string m_LockedFbxAssetPath = string.Empty;
         private MaterialSearchMode m_MaterialSearchMode = MaterialSearchMode.Global;
+        private bool m_IsUseFbxMaterialNameAsSearchKey = false;
         private DefaultAsset m_SearchFolder;
         private readonly List<FbxMaterialEntry> m_FbxMaterialEntries = new List<FbxMaterialEntry>();
 
@@ -89,12 +86,11 @@ namespace AzumisEditorTools
         private readonly List<PrefabMaterialEntry> m_PrefabMaterialEntries = new List<PrefabMaterialEntry>();
         private DefaultAsset m_PrefabSearchFolder;
         private GameObject m_PrefabSceneInstanceRoot;
+        private bool m_IsUsePrefabMeshFbxMaterialNameAsSearchKey = false;
 
         private Vector2 m_ScrollPosition;
         private bool m_IsFbxResultsExpanded = false;
         private bool m_IsPrefabResultsExpanded = false;
-        private WindowState m_LoadedWindowState;
-        private bool m_IsRestoringWindowState;
 
         [MenuItem("Tools/Azumi/模型材质/FBX Remapped Materials 工具")]
         public static void ShowWindow()
@@ -104,28 +100,13 @@ namespace AzumisEditorTools
             window.Show();
         }
 
-        private void OnEnable()
-        {
-            LoadWindowState();
-        }
-
-        private void OnDisable()
-        {
-            SaveWindowState();
-        }
-
         private void OnGUI()
         {
-            EditorGUI.BeginChangeCheck();
             m_ScrollPosition = EditorGUILayout.BeginScrollView(m_ScrollPosition);
             DrawFbxRemapSection();
             EditorGUILayout.Space(12f);
             DrawPrefabReplaceSection();
             EditorGUILayout.EndScrollView();
-            if (EditorGUI.EndChangeCheck())
-            {
-                SaveWindowState();
-            }
         }
 
         private void DrawFbxRemapSection()
@@ -157,6 +138,7 @@ namespace AzumisEditorTools
 
             EditorGUILayout.LabelField("已锁定路径", m_LockedFbxAssetPath);
             m_MaterialSearchMode = (MaterialSearchMode)EditorGUILayout.EnumPopup("查找模式", m_MaterialSearchMode);
+            m_IsUseFbxMaterialNameAsSearchKey = EditorGUILayout.ToggleLeft("使用 FBX 本体材质名称作为查找 Key", m_IsUseFbxMaterialNameAsSearchKey);
             if (m_MaterialSearchMode == MaterialSearchMode.Folder)
             {
                 m_SearchFolder = (DefaultAsset)EditorGUILayout.ObjectField("材质查找目录", m_SearchFolder, typeof(DefaultAsset), false);
@@ -166,7 +148,6 @@ namespace AzumisEditorTools
             if (GUILayout.Button("按名称查找材质"))
             {
                 AutoMatchFbxMaterials();
-                SaveWindowState();
             }
 
             using (new EditorGUI.DisabledScope(m_FbxMaterialEntries.Count == 0))
@@ -174,7 +155,6 @@ namespace AzumisEditorTools
                 if (GUILayout.Button("应用 Remapped Materials"))
                 {
                     ApplyFbxMaterialRemaps();
-                    SaveWindowState();
                 }
             }
             EditorGUILayout.EndHorizontal();
@@ -270,6 +250,12 @@ namespace AzumisEditorTools
             }
 
             m_PrefabSearchFolder = (DefaultAsset)EditorGUILayout.ObjectField("材质查找目录", m_PrefabSearchFolder, typeof(DefaultAsset), false);
+            EditorGUI.BeginChangeCheck();
+            m_IsUsePrefabMeshFbxMaterialNameAsSearchKey = EditorGUILayout.ToggleLeft("使用 Mesh 对应原 FBX 材质名作为查找 Key", m_IsUsePrefabMeshFbxMaterialNameAsSearchKey);
+            if (EditorGUI.EndChangeCheck())
+            {
+                ScanPrefabMaterials(m_PrefabAsset);
+            }
 
             EditorGUILayout.BeginHorizontal();
             using (new EditorGUI.DisabledScope(m_PrefabMaterialEntries.Count == 0))
@@ -277,7 +263,6 @@ namespace AzumisEditorTools
                 if (GUILayout.Button("按名称填充替换材质"))
                 {
                     AutoMatchPrefabMaterialsByName();
-                    SaveWindowState();
                 }
             }
 
@@ -286,7 +271,6 @@ namespace AzumisEditorTools
                 if (GUILayout.Button("同名材质一键全部替换"))
                 {
                     ReplacePrefabMaterialsBySameNameInFolder();
-                    SaveWindowState();
                 }
             }
             EditorGUILayout.EndHorizontal();
@@ -296,7 +280,6 @@ namespace AzumisEditorTools
                 if (GUILayout.Button("应用预制件材质替换"))
                 {
                     ApplyPrefabMaterialReplacement();
-                    SaveWindowState();
                 }
             }
 
@@ -334,8 +317,27 @@ namespace AzumisEditorTools
 
             using (new EditorGUI.DisabledScope(true))
             {
-                EditorGUILayout.ObjectField("源材质", entry.m_SourceMaterial, typeof(Material), false);
+                if (entry.m_SourceMaterial != null)
+                {
+                    EditorGUILayout.ObjectField("源材质", entry.m_SourceMaterial, typeof(Material), false);
+                }
+                else
+                {
+                    EditorGUILayout.TextField("源材质", entry.m_SourceDisplayName);
+                }
             }
+
+            string lookupKey = GetPrefabMaterialLookupKey(entry);
+            if (!string.IsNullOrEmpty(lookupKey))
+            {
+                EditorGUILayout.TextField("查找 Key", lookupKey);
+            }
+
+            if (m_IsUsePrefabMeshFbxMaterialNameAsSearchKey && entry.m_HasFbxMaterialLookupKeyConflict)
+            {
+                EditorGUILayout.HelpBox("该材质在不同 Mesh 槽位上对应多个原 FBX 材质名，已回退为当前材质名进行查找。", MessageType.Warning);
+            }
+
             entry.m_TargetMaterial = (Material)EditorGUILayout.ObjectField("替换材质", entry.m_TargetMaterial, typeof(Material), false);
 
             if (entry.m_IsExpanded)
@@ -424,8 +426,6 @@ namespace AzumisEditorTools
 
                 m_FbxMaterialEntries.Add(entry);
             }
-
-            ApplyLoadedFbxTargets();
         }
 
         private void AutoMatchFbxMaterials()
@@ -449,7 +449,8 @@ namespace AzumisEditorTools
                 entry.m_CandidateCount = 0;
                 entry.m_CandidatePreviewPath = string.Empty;
 
-                FindBestMatchByRegexAndOverlap(entry.m_SourceName, candidates, tokenIndex, out Material bestMaterial, out int candidateCount, out string previewPath);
+                string lookupKey = GetFbxMaterialLookupKey(entry);
+                FindBestMatchByRegexAndOverlap(lookupKey, candidates, tokenIndex, out Material bestMaterial, out int candidateCount, out string previewPath);
                 entry.m_CandidateCount = candidateCount;
                 entry.m_TargetMaterial = bestMaterial;
                 entry.m_CandidatePreviewPath = previewPath;
@@ -535,7 +536,6 @@ namespace AzumisEditorTools
                 }
             }
 
-            SaveWindowState();
             importer.SaveAndReimport();
             RefreshFbxMaterialEntries(importer);
             AssetDatabase.Refresh();
@@ -567,20 +567,24 @@ namespace AzumisEditorTools
                     PrefabUtility.UnloadPrefabContents(prefabRoot);
                 }
 
-                SortPrefabMaterialEntries();
-                ApplyLoadedPrefabTargets();
+                m_PrefabMaterialEntries.Sort(ComparePrefabMaterialEntries);
                 return;
             }
 
             m_PrefabSceneInstanceRoot = PrefabUtility.GetNearestPrefabInstanceRoot(prefabAsset) ?? prefabAsset;
             m_PrefabAssetPath = PrefabUtility.GetPrefabAssetPathOfNearestInstanceRoot(m_PrefabSceneInstanceRoot);
             CollectPrefabMaterialEntries(m_PrefabSceneInstanceRoot, m_PrefabSceneInstanceRoot.transform);
-            SortPrefabMaterialEntries();
-            ApplyLoadedPrefabTargets();
+            m_PrefabMaterialEntries.Sort(ComparePrefabMaterialEntries);
         }
 
         private void CollectPrefabMaterialEntries(GameObject prefabRoot, Transform rootTransform)
         {
+            if (m_IsUsePrefabMeshFbxMaterialNameAsSearchKey)
+            {
+                CollectPrefabOriginalFbxMaterialEntries(prefabRoot, rootTransform);
+                return;
+            }
+
             Dictionary<Material, PrefabMaterialEntry> materialEntryMap = new Dictionary<Material, PrefabMaterialEntry>();
             Renderer[] renderers = prefabRoot.GetComponentsInChildren<Renderer>(true);
             for (int i = 0; i < renderers.Length; i++)
@@ -594,7 +598,8 @@ namespace AzumisEditorTools
                 Material[] materials = renderer.sharedMaterials;
                 for (int j = 0; j < materials.Length; j++)
                 {
-                    Material sourceMaterial = GetMaterialOrSourceFallback(renderer, materials, j);
+                    Material sourceMaterial = materials[j];
+                    string fbxMaterialLookupKey = ResolveRendererSlotFbxMaterialName(renderer, j);
                     if (sourceMaterial == null)
                     {
                         continue;
@@ -605,8 +610,59 @@ namespace AzumisEditorTools
                     {
                         entry = new PrefabMaterialEntry();
                         entry.m_SourceMaterial = sourceMaterial;
+                        entry.m_SourceDisplayName = sourceMaterial.name;
                         materialEntryMap.Add(sourceMaterial, entry);
                         m_PrefabMaterialEntries.Add(entry);
+                    }
+
+                    UpdatePrefabMaterialLookupKey(entry, fbxMaterialLookupKey);
+                    entry.m_UsageCount++;
+                    entry.m_RendererUsages.Add(CreateRendererUsageEntry(renderer, rootTransform, j));
+                }
+            }
+        }
+
+        // 在“原始 FBX 材质名”模式下，不再依赖 prefab 当前 sharedMaterials，
+        // 而是直接按 FBX 源 renderer 的原始材质槽状态收集可替换条目。
+        private void CollectPrefabOriginalFbxMaterialEntries(GameObject prefabRoot, Transform rootTransform)
+        {
+            Dictionary<string, PrefabMaterialEntry> materialEntryMap = new Dictionary<string, PrefabMaterialEntry>(StringComparer.OrdinalIgnoreCase);
+            Renderer[] renderers = prefabRoot.GetComponentsInChildren<Renderer>(true);
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                Renderer renderer = renderers[i];
+                if (!IsSupportedRenderer(renderer))
+                {
+                    continue;
+                }
+
+                if (!TryGetOriginalRendererMaterialState(renderer, out OriginalRendererMaterialState originalState))
+                {
+                    continue;
+                }
+
+                for (int j = 0; j < originalState.m_OriginalMaterials.Length; j++)
+                {
+                    Material sourceMaterial = originalState.m_OriginalMaterials[j];
+                    string lookupKey = originalState.m_OriginalMaterialNames[j];
+                    if (string.IsNullOrEmpty(lookupKey))
+                    {
+                        continue;
+                    }
+
+                    if (!materialEntryMap.TryGetValue(lookupKey, out PrefabMaterialEntry entry))
+                    {
+                        entry = new PrefabMaterialEntry();
+                        entry.m_SourceMaterial = sourceMaterial;
+                        entry.m_SourceDisplayName = sourceMaterial != null ? sourceMaterial.name : lookupKey;
+                        entry.m_FbxMaterialLookupKey = lookupKey;
+                        materialEntryMap.Add(lookupKey, entry);
+                        m_PrefabMaterialEntries.Add(entry);
+                    }
+                    else if (entry.m_SourceMaterial == null && sourceMaterial != null)
+                    {
+                        entry.m_SourceMaterial = sourceMaterial;
+                        entry.m_SourceDisplayName = sourceMaterial.name;
                     }
 
                     entry.m_UsageCount++;
@@ -619,6 +675,12 @@ namespace AzumisEditorTools
         {
             if (m_PrefabAsset == null)
             {
+                return;
+            }
+
+            if (m_IsUsePrefabMeshFbxMaterialNameAsSearchKey)
+            {
+                ApplyPrefabMaterialReplacementByOriginalFbxState();
                 return;
             }
 
@@ -640,7 +702,6 @@ namespace AzumisEditorTools
                 return;
             }
 
-            SaveWindowState();
             string prefabAssetPath = AssetDatabase.GetAssetPath(m_PrefabAsset);
             if (IsPrefabAssetPath(prefabAssetPath))
             {
@@ -659,7 +720,20 @@ namespace AzumisEditorTools
                         }
 
                         Material[] materials = renderer.sharedMaterials;
-                        if (!ReplaceMaterialSlotsInOrder(renderer, materials, replacementMap))
+                        bool isRendererChanged = false;
+                        for (int j = 0; j < materials.Length; j++)
+                        {
+                            Material replacementMaterial;
+                            if (!replacementMap.TryGetValue(materials[j], out replacementMaterial))
+                            {
+                                continue;
+                            }
+
+                            materials[j] = replacementMaterial;
+                            isRendererChanged = true;
+                        }
+
+                        if (!isRendererChanged)
                         {
                             continue;
                         }
@@ -705,7 +779,20 @@ namespace AzumisEditorTools
                 }
 
                 Material[] materials = renderer.sharedMaterials;
-                if (!ReplaceMaterialSlotsInOrder(renderer, materials, replacementMap))
+                bool isRendererChanged = false;
+                for (int j = 0; j < materials.Length; j++)
+                {
+                    Material replacementMaterial;
+                    if (!replacementMap.TryGetValue(materials[j], out replacementMaterial))
+                    {
+                        continue;
+                    }
+
+                    materials[j] = replacementMaterial;
+                    isRendererChanged = true;
+                }
+
+                if (!isRendererChanged)
                 {
                     continue;
                 }
@@ -734,335 +821,146 @@ namespace AzumisEditorTools
             EditorUtility.DisplayDialog("完成", "场景预制件实例材质替换已应用。", "确定");
         }
 
-        private static bool ReplaceMaterialSlotsInOrder(Renderer renderer, Material[] materials, Dictionary<Material, Material> replacementMap)
+        // 该分支会先恢复每个 renderer 在 FBX 中的原始材质槽数组，
+        // 再按 FBX 原材质名把命中的槽位替换为目标材质，完全忽略 prefab 当前材质槽状态。
+        private void ApplyPrefabMaterialReplacementByOriginalFbxState()
         {
-            if (renderer == null || materials == null || replacementMap == null || replacementMap.Count == 0)
+            Dictionary<string, Material> replacementMap = BuildPrefabOriginalMaterialReplacementMap();
+            if (replacementMap.Count == 0)
+            {
+                EditorUtility.DisplayDialog("提示", "请至少指定一个需要替换的目标材质。", "确定");
+                return;
+            }
+
+            string prefabAssetPath = AssetDatabase.GetAssetPath(m_PrefabAsset);
+            if (IsPrefabAssetPath(prefabAssetPath))
+            {
+                m_PrefabAssetPath = prefabAssetPath;
+                GameObject prefabRoot = PrefabUtility.LoadPrefabContents(m_PrefabAssetPath);
+                bool isChanged = false;
+                try
+                {
+                    isChanged = ApplyOriginalFbxStateToRenderers(prefabRoot, false);
+                    if (isChanged)
+                    {
+                        PrefabUtility.SaveAsPrefabAsset(prefabRoot, m_PrefabAssetPath);
+                    }
+                }
+                finally
+                {
+                    PrefabUtility.UnloadPrefabContents(prefabRoot);
+                }
+
+                if (!isChanged)
+                {
+                    EditorUtility.DisplayDialog("提示", "没有需要写回的材质替换。", "确定");
+                    return;
+                }
+
+                AssetDatabase.ImportAsset(m_PrefabAssetPath);
+                AssetDatabase.SaveAssets();
+                AssetDatabase.Refresh();
+                ScanPrefabMaterials(m_PrefabAsset);
+                EditorUtility.DisplayDialog("完成", "预制件材质替换已按 FBX 原始材质槽状态应用。", "确定");
+                return;
+            }
+
+            GameObject instanceRoot = m_PrefabSceneInstanceRoot != null ? m_PrefabSceneInstanceRoot : m_PrefabAsset;
+            bool isInstanceChanged = ApplyOriginalFbxStateToRenderers(instanceRoot, true);
+            if (!isInstanceChanged)
+            {
+                EditorUtility.DisplayDialog("提示", "没有需要写回的材质替换。", "确定");
+                return;
+            }
+
+            EditorSceneManager.MarkSceneDirty(instanceRoot.scene);
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+            ScanPrefabMaterials(m_PrefabAsset);
+            EditorUtility.DisplayDialog("完成", "场景预制件实例材质替换已按 FBX 原始材质槽状态应用。", "确定");
+        }
+
+        private Dictionary<string, Material> BuildPrefabOriginalMaterialReplacementMap()
+        {
+            Dictionary<string, Material> replacementMap = new Dictionary<string, Material>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < m_PrefabMaterialEntries.Count; i++)
+            {
+                PrefabMaterialEntry entry = m_PrefabMaterialEntries[i];
+                string lookupKey = GetPrefabMaterialLookupKey(entry);
+                if (string.IsNullOrEmpty(lookupKey) || entry.m_TargetMaterial == null)
+                {
+                    continue;
+                }
+
+                replacementMap[lookupKey] = entry.m_TargetMaterial;
+            }
+
+            return replacementMap;
+        }
+
+        private bool ApplyOriginalFbxStateToRenderers(GameObject rootObject, bool isRecordUndo)
+        {
+            if (rootObject == null)
             {
                 return false;
             }
 
+            Dictionary<string, Material> replacementMap = BuildPrefabOriginalMaterialReplacementMap();
+            Renderer[] renderers = rootObject.GetComponentsInChildren<Renderer>(true);
             bool isChanged = false;
-            for (int i = 0; i < materials.Length; i++)
+            for (int i = 0; i < renderers.Length; i++)
             {
-                Material sourceMaterial = GetMaterialOrSourceFallback(renderer, materials, i);
-                if (sourceMaterial == null)
+                Renderer renderer = renderers[i];
+                if (!IsSupportedRenderer(renderer))
                 {
                     continue;
                 }
 
-                Material replacementMaterial;
-                if (!replacementMap.TryGetValue(sourceMaterial, out replacementMaterial))
+                if (!TryGetOriginalRendererMaterialState(renderer, out OriginalRendererMaterialState originalState))
                 {
                     continue;
                 }
 
-                materials[i] = replacementMaterial;
+                Material[] currentMaterials = renderer.sharedMaterials;
+                Material[] targetMaterials = new Material[originalState.m_OriginalMaterials.Length];
+                bool isRendererChanged = currentMaterials.Length != targetMaterials.Length;
+                for (int j = 0; j < originalState.m_OriginalMaterials.Length; j++)
+                {
+                    Material targetMaterial = originalState.m_OriginalMaterials[j];
+                    string lookupKey = originalState.m_OriginalMaterialNames[j];
+                    if (!string.IsNullOrEmpty(lookupKey) && replacementMap.TryGetValue(lookupKey, out Material replacementMaterial))
+                    {
+                        targetMaterial = replacementMaterial;
+                    }
+
+                    targetMaterials[j] = targetMaterial;
+                    if (!isRendererChanged && currentMaterials[j] != targetMaterial)
+                    {
+                        isRendererChanged = true;
+                    }
+                }
+
+                if (!isRendererChanged)
+                {
+                    continue;
+                }
+
+                if (isRecordUndo)
+                {
+                    Undo.RecordObject(renderer, "Replace Prefab Materials");
+                }
+
+                renderer.sharedMaterials = targetMaterials;
+                EditorUtility.SetDirty(renderer);
+                if (isRecordUndo && PrefabUtility.IsPartOfPrefabInstance(renderer))
+                {
+                    PrefabUtility.RecordPrefabInstancePropertyModifications(renderer);
+                }
+
                 isChanged = true;
             }
 
             return isChanged;
-        }
-
-        private static Material GetMaterialOrSourceFallback(Renderer renderer, Material[] materials, int materialSlotIndex)
-        {
-            if (materials != null && materialSlotIndex >= 0 && materialSlotIndex < materials.Length && materials[materialSlotIndex] != null)
-            {
-                return materials[materialSlotIndex];
-            }
-
-            Renderer sourceRenderer = renderer;
-            while (sourceRenderer != null)
-            {
-                sourceRenderer = PrefabUtility.GetCorrespondingObjectFromSource(sourceRenderer);
-                if (sourceRenderer == null)
-                {
-                    break;
-                }
-
-                Material[] sourceMaterials = sourceRenderer.sharedMaterials;
-                if (sourceMaterials == null || materialSlotIndex < 0 || materialSlotIndex >= sourceMaterials.Length)
-                {
-                    continue;
-                }
-
-                Material sourceMaterial = sourceMaterials[materialSlotIndex];
-                if (sourceMaterial != null)
-                {
-                    return sourceMaterial;
-                }
-            }
-
-            return null;
-        }
-
-        private void LoadWindowState()
-        {
-            string json = EditorPrefs.GetString(m_WindowStateEditorPrefsKey, string.Empty);
-            if (string.IsNullOrEmpty(json))
-            {
-                return;
-            }
-
-            WindowState state;
-            try
-            {
-                state = JsonUtility.FromJson<WindowState>(json);
-            }
-            catch (ArgumentException)
-            {
-                return;
-            }
-
-            if (state == null)
-            {
-                return;
-            }
-
-            m_IsRestoringWindowState = true;
-            m_LoadedWindowState = state;
-            try
-            {
-                m_MaterialSearchMode = Enum.IsDefined(typeof(MaterialSearchMode), state.m_MaterialSearchMode)
-                    ? (MaterialSearchMode)state.m_MaterialSearchMode
-                    : MaterialSearchMode.Global;
-                m_SearchFolder = LoadAssetAtPath<DefaultAsset>(state.m_SearchFolderPath);
-                m_PrefabSearchFolder = LoadAssetAtPath<DefaultAsset>(state.m_PrefabSearchFolderPath);
-                m_IsFbxResultsExpanded = state.m_IsFbxResultsExpanded;
-                m_IsPrefabResultsExpanded = state.m_IsPrefabResultsExpanded;
-                m_ScrollPosition = state.m_ScrollPosition;
-
-                m_FbxAsset = LoadAssetAtPath<GameObject>(state.m_FbxAssetPath);
-                if (m_FbxAsset != null)
-                {
-                    LockFbxAsset(m_FbxAsset);
-                }
-
-                m_PrefabAsset = LoadAssetAtPath<GameObject>(state.m_PrefabAssetPath);
-                if (m_PrefabAsset != null)
-                {
-                    ScanPrefabMaterials(m_PrefabAsset);
-                }
-            }
-            finally
-            {
-                m_IsRestoringWindowState = false;
-            }
-        }
-
-        private void SaveWindowState()
-        {
-            if (m_IsRestoringWindowState)
-            {
-                return;
-            }
-
-            WindowState state = new WindowState();
-            state.m_FbxAssetPath = !string.IsNullOrEmpty(m_LockedFbxAssetPath) ? m_LockedFbxAssetPath : AssetDatabase.GetAssetPath(m_FbxAsset);
-            state.m_MaterialSearchMode = (int)m_MaterialSearchMode;
-            state.m_SearchFolderPath = AssetDatabase.GetAssetPath(m_SearchFolder);
-            state.m_PrefabAssetPath = GetPrefabStatePath();
-            state.m_PrefabSearchFolderPath = AssetDatabase.GetAssetPath(m_PrefabSearchFolder);
-            state.m_IsFbxResultsExpanded = m_IsFbxResultsExpanded;
-            state.m_IsPrefabResultsExpanded = m_IsPrefabResultsExpanded;
-            state.m_ScrollPosition = m_ScrollPosition;
-            SaveFbxTargets(state.m_FbxTargets);
-            SavePrefabTargets(state.m_PrefabTargets);
-
-            EditorPrefs.SetString(m_WindowStateEditorPrefsKey, JsonUtility.ToJson(state));
-            m_LoadedWindowState = state;
-        }
-
-        private string GetPrefabStatePath()
-        {
-            string prefabAssetPath = AssetDatabase.GetAssetPath(m_PrefabAsset);
-            if (!string.IsNullOrEmpty(prefabAssetPath))
-            {
-                return prefabAssetPath;
-            }
-
-            return m_PrefabAssetPath;
-        }
-
-        private void SaveFbxTargets(List<MaterialTargetState> targetStates)
-        {
-            if (targetStates == null)
-            {
-                return;
-            }
-
-            for (int i = 0; i < m_FbxMaterialEntries.Count; i++)
-            {
-                FbxMaterialEntry entry = m_FbxMaterialEntries[i];
-                if (entry == null || entry.m_TargetMaterial == null)
-                {
-                    continue;
-                }
-
-                targetStates.Add(CreateMaterialTargetState(entry.m_SourceName, entry.m_TargetMaterial));
-            }
-        }
-
-        private void SavePrefabTargets(List<MaterialTargetState> targetStates)
-        {
-            if (targetStates == null)
-            {
-                return;
-            }
-
-            for (int i = 0; i < m_PrefabMaterialEntries.Count; i++)
-            {
-                PrefabMaterialEntry entry = m_PrefabMaterialEntries[i];
-                if (entry == null || entry.m_SourceMaterial == null || entry.m_TargetMaterial == null)
-                {
-                    continue;
-                }
-
-                targetStates.Add(CreateMaterialTargetState(GetMaterialStateKey(entry.m_SourceMaterial), entry.m_TargetMaterial));
-            }
-        }
-
-        private static MaterialTargetState CreateMaterialTargetState(string sourceKey, Material targetMaterial)
-        {
-            MaterialTargetState state = new MaterialTargetState();
-            state.m_SourceKey = sourceKey ?? string.Empty;
-            state.m_TargetPath = AssetDatabase.GetAssetPath(targetMaterial);
-            state.m_TargetName = targetMaterial != null ? targetMaterial.name : string.Empty;
-            return state;
-        }
-
-        private void ApplyLoadedFbxTargets()
-        {
-            if (m_LoadedWindowState == null || m_LoadedWindowState.m_FbxTargets == null)
-            {
-                return;
-            }
-
-            Dictionary<string, MaterialTargetState> targetStateMap = BuildTargetStateMap(m_LoadedWindowState.m_FbxTargets);
-            for (int i = 0; i < m_FbxMaterialEntries.Count; i++)
-            {
-                FbxMaterialEntry entry = m_FbxMaterialEntries[i];
-                if (entry == null || string.IsNullOrEmpty(entry.m_SourceName))
-                {
-                    continue;
-                }
-
-                MaterialTargetState targetState;
-                if (!targetStateMap.TryGetValue(entry.m_SourceName, out targetState))
-                {
-                    continue;
-                }
-
-                Material targetMaterial = LoadMaterialTarget(targetState);
-                if (targetMaterial != null)
-                {
-                    entry.m_TargetMaterial = targetMaterial;
-                    entry.m_CandidatePreviewPath = AssetDatabase.GetAssetPath(targetMaterial);
-                    entry.m_CandidateCount = Mathf.Max(entry.m_CandidateCount, 1);
-                }
-            }
-        }
-
-        private void ApplyLoadedPrefabTargets()
-        {
-            if (m_LoadedWindowState == null || m_LoadedWindowState.m_PrefabTargets == null)
-            {
-                return;
-            }
-
-            Dictionary<string, MaterialTargetState> targetStateMap = BuildTargetStateMap(m_LoadedWindowState.m_PrefabTargets);
-            for (int i = 0; i < m_PrefabMaterialEntries.Count; i++)
-            {
-                PrefabMaterialEntry entry = m_PrefabMaterialEntries[i];
-                if (entry == null || entry.m_SourceMaterial == null)
-                {
-                    continue;
-                }
-
-                MaterialTargetState targetState;
-                if (!targetStateMap.TryGetValue(GetMaterialStateKey(entry.m_SourceMaterial), out targetState))
-                {
-                    continue;
-                }
-
-                Material targetMaterial = LoadMaterialTarget(targetState);
-                if (targetMaterial != null)
-                {
-                    entry.m_TargetMaterial = targetMaterial;
-                }
-            }
-        }
-
-        private static Dictionary<string, MaterialTargetState> BuildTargetStateMap(List<MaterialTargetState> targetStates)
-        {
-            Dictionary<string, MaterialTargetState> targetStateMap = new Dictionary<string, MaterialTargetState>(StringComparer.OrdinalIgnoreCase);
-            for (int i = 0; i < targetStates.Count; i++)
-            {
-                MaterialTargetState targetState = targetStates[i];
-                if (targetState == null || string.IsNullOrEmpty(targetState.m_SourceKey))
-                {
-                    continue;
-                }
-
-                targetStateMap[targetState.m_SourceKey] = targetState;
-            }
-
-            return targetStateMap;
-        }
-
-        private static Material LoadMaterialTarget(MaterialTargetState targetState)
-        {
-            if (targetState == null || string.IsNullOrEmpty(targetState.m_TargetPath))
-            {
-                return null;
-            }
-
-            Material material = AssetDatabase.LoadAssetAtPath<Material>(targetState.m_TargetPath);
-            if (material != null && (string.IsNullOrEmpty(targetState.m_TargetName) || string.Equals(material.name, targetState.m_TargetName, StringComparison.OrdinalIgnoreCase)))
-            {
-                return material;
-            }
-
-            UnityEngine.Object[] assets = AssetDatabase.LoadAllAssetsAtPath(targetState.m_TargetPath);
-            for (int i = 0; i < assets.Length; i++)
-            {
-                Material subMaterial = assets[i] as Material;
-                if (subMaterial == null)
-                {
-                    continue;
-                }
-
-                if (string.IsNullOrEmpty(targetState.m_TargetName) || string.Equals(subMaterial.name, targetState.m_TargetName, StringComparison.OrdinalIgnoreCase))
-                {
-                    return subMaterial;
-                }
-            }
-
-            return material;
-        }
-
-        private static T LoadAssetAtPath<T>(string assetPath) where T : UnityEngine.Object
-        {
-            return string.IsNullOrEmpty(assetPath) ? null : AssetDatabase.LoadAssetAtPath<T>(assetPath);
-        }
-
-        private static string GetMaterialStateKey(Material material)
-        {
-            if (material == null)
-            {
-                return string.Empty;
-            }
-
-            return AssetDatabase.GetAssetPath(material) + "|" + material.name;
-        }
-
-        private void SortPrefabMaterialEntries()
-        {
-            m_PrefabMaterialEntries.Sort((left, right) =>
-            {
-                string leftName = left != null && left.m_SourceMaterial != null ? left.m_SourceMaterial.name : string.Empty;
-                string rightName = right != null && right.m_SourceMaterial != null ? right.m_SourceMaterial.name : string.Empty;
-                return string.Compare(leftName, rightName, StringComparison.OrdinalIgnoreCase);
-            });
         }
 
         private string[] GetSearchFolders()
@@ -1110,13 +1008,18 @@ namespace AzumisEditorTools
 
         private List<AssetImporter.SourceAssetIdentifier> GetSourceMaterialIdentifiersByRendererNames()
         {
+            return GetSourceMaterialIdentifiersByRendererNames(m_LockedFbxAssetPath);
+        }
+
+        private static List<AssetImporter.SourceAssetIdentifier> GetSourceMaterialIdentifiersByRendererNames(string modelAssetPath)
+        {
             List<AssetImporter.SourceAssetIdentifier> identifiers = new List<AssetImporter.SourceAssetIdentifier>();
-            if (string.IsNullOrEmpty(m_LockedFbxAssetPath))
+            if (string.IsNullOrEmpty(modelAssetPath))
             {
                 return identifiers;
             }
 
-            GameObject modelRoot = AssetDatabase.LoadAssetAtPath<GameObject>(m_LockedFbxAssetPath);
+            GameObject modelRoot = AssetDatabase.LoadAssetAtPath<GameObject>(modelAssetPath);
             if (modelRoot == null)
             {
                 return identifiers;
@@ -1200,6 +1103,382 @@ namespace AzumisEditorTools
             }
 
             return fallbackName;
+        }
+
+        private string GetFbxMaterialLookupKey(FbxMaterialEntry entry)
+        {
+            if (entry == null)
+            {
+                return string.Empty;
+            }
+
+            if (m_IsUseFbxMaterialNameAsSearchKey && entry.m_SourceMaterial != null && !string.IsNullOrEmpty(entry.m_SourceMaterial.name))
+            {
+                return entry.m_SourceMaterial.name;
+            }
+
+            return entry.m_SourceName;
+        }
+
+        // 预制件自动匹配时，优先使用 mesh 槽位所属 FBX 的原材质名；解析失败或冲突时回退到当前材质名。
+        private string GetPrefabMaterialLookupKey(PrefabMaterialEntry entry)
+        {
+            if (entry == null)
+            {
+                return string.Empty;
+            }
+
+            if (m_IsUsePrefabMeshFbxMaterialNameAsSearchKey &&
+                !entry.m_HasFbxMaterialLookupKeyConflict &&
+                !string.IsNullOrEmpty(entry.m_FbxMaterialLookupKey))
+            {
+                return entry.m_FbxMaterialLookupKey;
+            }
+
+            if (entry.m_SourceMaterial == null)
+            {
+                return entry.m_SourceDisplayName;
+            }
+
+            return entry.m_SourceMaterial.name;
+        }
+
+        // 同一个材质如果对应多个不同的 FBX 原材质名，则停止使用 FBX 名称，避免错误自动映射。
+        private static void UpdatePrefabMaterialLookupKey(PrefabMaterialEntry entry, string lookupKey)
+        {
+            if (entry == null || string.IsNullOrEmpty(lookupKey) || entry.m_HasFbxMaterialLookupKeyConflict)
+            {
+                return;
+            }
+
+            if (string.IsNullOrEmpty(entry.m_FbxMaterialLookupKey))
+            {
+                entry.m_FbxMaterialLookupKey = lookupKey;
+                return;
+            }
+
+            if (!string.Equals(entry.m_FbxMaterialLookupKey, lookupKey, StringComparison.OrdinalIgnoreCase))
+            {
+                entry.m_FbxMaterialLookupKey = string.Empty;
+                entry.m_HasFbxMaterialLookupKeyConflict = true;
+            }
+        }
+
+        // 根据 renderer 当前材质槽绑定的 mesh，回查来源 FBX 中同槽位的原始材质名。
+        private string ResolveRendererSlotFbxMaterialName(Renderer renderer, int materialSlotIndex)
+        {
+            Mesh sharedMesh = GetRendererSharedMesh(renderer);
+            if (sharedMesh == null)
+            {
+                return string.Empty;
+            }
+
+            string modelAssetPath = AssetDatabase.GetAssetPath(sharedMesh);
+            if (!IsFbxAssetPath(modelAssetPath))
+            {
+                return string.Empty;
+            }
+
+            ModelImporter importer = AssetImporter.GetAtPath(modelAssetPath) as ModelImporter;
+            if (importer == null)
+            {
+                return string.Empty;
+            }
+
+            List<AssetImporter.SourceAssetIdentifier> sourceIdentifiers = GetSourceMaterialIdentifiersByReflection(importer);
+            if (sourceIdentifiers.Count == 0)
+            {
+                sourceIdentifiers = GetSourceMaterialIdentifiersBySerializedImporter(importer);
+            }
+
+            if (sourceIdentifiers.Count == 0)
+            {
+                sourceIdentifiers = GetSourceMaterialIdentifiersByRendererNames(modelAssetPath);
+            }
+
+            if (materialSlotIndex < 0 || materialSlotIndex >= sourceIdentifiers.Count)
+            {
+                return string.Empty;
+            }
+
+            return GetIdentifierName(sourceIdentifiers[materialSlotIndex], string.Empty);
+        }
+
+        private static int ComparePrefabMaterialEntries(PrefabMaterialEntry left, PrefabMaterialEntry right)
+        {
+            string leftName = GetPrefabMaterialEntryDisplayName(left);
+            string rightName = GetPrefabMaterialEntryDisplayName(right);
+            return string.Compare(leftName, rightName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string GetPrefabMaterialEntryDisplayName(PrefabMaterialEntry entry)
+        {
+            if (entry == null)
+            {
+                return string.Empty;
+            }
+
+            if (!string.IsNullOrEmpty(entry.m_SourceDisplayName))
+            {
+                return entry.m_SourceDisplayName;
+            }
+
+            if (entry.m_SourceMaterial != null)
+            {
+                return entry.m_SourceMaterial.name;
+            }
+
+            return entry.m_FbxMaterialLookupKey;
+        }
+
+        // 沿着 Prefab/模型来源链一直回溯，直到拿到真正来自 FBX 模型资源的源 renderer。
+        // 原始材质状态只从 FBX 直出资源本体读取，不参考 prefab 当前材质与当前材质槽设置。
+        private bool TryGetOriginalRendererMaterialState(Renderer renderer, out OriginalRendererMaterialState originalState)
+        {
+            originalState = null;
+            Renderer sourceRenderer = ResolveOriginalFbxRenderer(renderer);
+            if (sourceRenderer == null)
+            {
+                return false;
+            }
+
+            string fbxAssetPath = AssetDatabase.GetAssetPath(sourceRenderer.gameObject);
+            if (!IsFbxAssetPath(fbxAssetPath))
+            {
+                return false;
+            }
+
+            if (!TryBuildOriginalFbxRendererStateMap(fbxAssetPath, out OriginalFbxRendererStateMap stateMap))
+            {
+                return false;
+            }
+
+            GameObject fbxRoot = AssetDatabase.LoadAssetAtPath<GameObject>(fbxAssetPath);
+            if (fbxRoot == null)
+            {
+                return false;
+            }
+
+            string rendererRelativePath = GetRendererRelativePath(sourceRenderer.transform, fbxRoot.transform);
+            return stateMap.m_RendererStateByPath.TryGetValue(rendererRelativePath, out originalState);
+        }
+
+        private Renderer ResolveOriginalFbxRenderer(Renderer renderer)
+        {
+            if (renderer == null)
+            {
+                return null;
+            }
+
+            Renderer currentRenderer = renderer;
+            HashSet<int> visited = new HashSet<int>();
+            while (currentRenderer != null && visited.Add(currentRenderer.GetInstanceID()))
+            {
+                Mesh sharedMesh = GetRendererSharedMesh(currentRenderer);
+                string meshAssetPath = sharedMesh != null ? AssetDatabase.GetAssetPath(sharedMesh) : string.Empty;
+                string rendererAssetPath = AssetDatabase.GetAssetPath(currentRenderer.gameObject);
+                if (IsFbxAssetPath(meshAssetPath) && IsFbxAssetPath(rendererAssetPath))
+                {
+                    return currentRenderer;
+                }
+
+                Renderer sourceRenderer = PrefabUtility.GetCorrespondingObjectFromSource(currentRenderer);
+                if (sourceRenderer == null || sourceRenderer == currentRenderer)
+                {
+                    break;
+                }
+
+                currentRenderer = sourceRenderer;
+            }
+
+            return null;
+        }
+
+        private bool TryBuildOriginalFbxRendererStateMap(string fbxAssetPath, out OriginalFbxRendererStateMap stateMap)
+        {
+            stateMap = null;
+            if (!IsFbxAssetPath(fbxAssetPath))
+            {
+                return false;
+            }
+
+            GameObject fbxRoot = AssetDatabase.LoadAssetAtPath<GameObject>(fbxAssetPath);
+            if (fbxRoot == null)
+            {
+                return false;
+            }
+
+            ModelImporter importer = AssetImporter.GetAtPath(fbxAssetPath) as ModelImporter;
+            if (importer == null)
+            {
+                return false;
+            }
+
+            BuildOriginalFbxMaterialNameLookup(importer, fbxAssetPath, out OriginalFbxMaterialNameLookup materialNameLookup);
+            Renderer[] sourceRenderers = fbxRoot.GetComponentsInChildren<Renderer>(true);
+            OriginalFbxRendererStateMap result = new OriginalFbxRendererStateMap();
+            for (int i = 0; i < sourceRenderers.Length; i++)
+            {
+                Renderer sourceRenderer = sourceRenderers[i];
+                if (!IsSupportedRenderer(sourceRenderer))
+                {
+                    continue;
+                }
+
+                Material[] sourceMaterials = sourceRenderer.sharedMaterials;
+                if (sourceMaterials == null || sourceMaterials.Length == 0)
+                {
+                    continue;
+                }
+
+                OriginalRendererMaterialState rendererState = new OriginalRendererMaterialState();
+                rendererState.m_OriginalMaterials = new Material[sourceMaterials.Length];
+                rendererState.m_OriginalMaterialNames = new string[sourceMaterials.Length];
+                for (int j = 0; j < sourceMaterials.Length; j++)
+                {
+                    Material sourceMaterial = sourceMaterials[j];
+                    rendererState.m_OriginalMaterials[j] = sourceMaterial;
+                    rendererState.m_OriginalMaterialNames[j] = GetOriginalFbxMaterialName(sourceMaterial, materialNameLookup);
+                }
+
+                string rendererRelativePath = GetRendererRelativePath(sourceRenderer.transform, fbxRoot.transform);
+                result.m_RendererStateByPath[rendererRelativePath] = rendererState;
+            }
+
+            stateMap = result;
+            return true;
+        }
+
+        private void BuildOriginalFbxMaterialNameLookup(ModelImporter importer, string fbxAssetPath, out OriginalFbxMaterialNameLookup materialNameLookup)
+        {
+            materialNameLookup = new OriginalFbxMaterialNameLookup();
+
+            List<AssetImporter.SourceAssetIdentifier> orderedSourceIdentifiers = GetOrderedSourceMaterialIdentifiers(importer, fbxAssetPath);
+            Material[] embeddedMaterials = AssetDatabase.LoadAllAssetRepresentationsAtPath(fbxAssetPath)
+                .OfType<Material>()
+                .ToArray();
+
+            int pairCount = Mathf.Min(orderedSourceIdentifiers.Count, embeddedMaterials.Length);
+            for (int i = 0; i < pairCount; i++)
+            {
+                Material embeddedMaterial = embeddedMaterials[i];
+                if (embeddedMaterial == null)
+                {
+                    continue;
+                }
+
+                string originalMaterialName = GetIdentifierName(orderedSourceIdentifiers[i], string.Empty);
+                if (string.IsNullOrEmpty(originalMaterialName))
+                {
+                    continue;
+                }
+
+                materialNameLookup.m_NameByMaterialId[embeddedMaterial.GetInstanceID()] = originalMaterialName;
+                if (!materialNameLookup.m_NameByMaterialName.ContainsKey(embeddedMaterial.name))
+                {
+                    materialNameLookup.m_NameByMaterialName.Add(embeddedMaterial.name, originalMaterialName);
+                }
+            }
+        }
+
+        private string GetOriginalFbxMaterialName(Material sourceMaterial, OriginalFbxMaterialNameLookup materialNameLookup)
+        {
+            if (sourceMaterial == null)
+            {
+                return string.Empty;
+            }
+
+            if (materialNameLookup != null)
+            {
+                if (materialNameLookup.m_NameByMaterialId.TryGetValue(sourceMaterial.GetInstanceID(), out string originalMaterialName))
+                {
+                    return originalMaterialName;
+                }
+
+                if (materialNameLookup.m_NameByMaterialName.TryGetValue(sourceMaterial.name, out originalMaterialName))
+                {
+                    return originalMaterialName;
+                }
+            }
+
+            return sourceMaterial.name;
+        }
+
+        private List<AssetImporter.SourceAssetIdentifier> GetOrderedSourceMaterialIdentifiers(ModelImporter importer, string modelAssetPath)
+        {
+            List<AssetImporter.SourceAssetIdentifier> sourceIdentifiers = GetSourceMaterialIdentifiersByReflection(importer);
+            if (sourceIdentifiers.Count > 0)
+            {
+                return sourceIdentifiers;
+            }
+
+            sourceIdentifiers = GetOrderedSourceMaterialIdentifiersBySerializedImporter(importer);
+            if (sourceIdentifiers.Count > 0)
+            {
+                return sourceIdentifiers;
+            }
+
+            return GetOrderedSourceMaterialIdentifiersByRendererSlots(modelAssetPath);
+        }
+
+        private static List<AssetImporter.SourceAssetIdentifier> GetOrderedSourceMaterialIdentifiersBySerializedImporter(ModelImporter importer)
+        {
+            List<AssetImporter.SourceAssetIdentifier> identifiers = new List<AssetImporter.SourceAssetIdentifier>();
+            SerializedObject serializedObject = new SerializedObject(importer);
+            SerializedProperty materialsProperty = serializedObject.FindProperty("m_Materials");
+            if (materialsProperty == null || !materialsProperty.isArray)
+            {
+                return identifiers;
+            }
+
+            for (int i = 0; i < materialsProperty.arraySize; i++)
+            {
+                SerializedProperty element = materialsProperty.GetArrayElementAtIndex(i);
+                if (element == null)
+                {
+                    continue;
+                }
+
+                SerializedProperty nameProperty = element.FindPropertyRelative("name");
+                string materialName = nameProperty != null ? nameProperty.stringValue : string.Empty;
+                identifiers.Add(new AssetImporter.SourceAssetIdentifier(typeof(Material), materialName));
+            }
+
+            return identifiers;
+        }
+
+        private static List<AssetImporter.SourceAssetIdentifier> GetOrderedSourceMaterialIdentifiersByRendererSlots(string modelAssetPath)
+        {
+            List<AssetImporter.SourceAssetIdentifier> identifiers = new List<AssetImporter.SourceAssetIdentifier>();
+            if (string.IsNullOrEmpty(modelAssetPath))
+            {
+                return identifiers;
+            }
+
+            GameObject modelRoot = AssetDatabase.LoadAssetAtPath<GameObject>(modelAssetPath);
+            if (modelRoot == null)
+            {
+                return identifiers;
+            }
+
+            Renderer[] renderers = modelRoot.GetComponentsInChildren<Renderer>(true);
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                Renderer renderer = renderers[i];
+                if (!IsSupportedRenderer(renderer))
+                {
+                    continue;
+                }
+
+                Material[] materials = renderer.sharedMaterials;
+                for (int j = 0; j < materials.Length; j++)
+                {
+                    Material material = materials[j];
+                    identifiers.Add(new AssetImporter.SourceAssetIdentifier(typeof(Material), material != null ? material.name : string.Empty));
+                }
+            }
+
+            return identifiers;
         }
 
         private static bool IsFbxAssetPath(string assetPath)
@@ -1293,7 +1572,8 @@ namespace AzumisEditorTools
                     continue;
                 }
 
-                FindBestMatchByRegexAndOverlap(entry.m_SourceMaterial.name, candidates, tokenIndex, out Material bestMaterial, out _, out _);
+                string lookupKey = GetPrefabMaterialLookupKey(entry);
+                FindBestMatchByRegexAndOverlap(lookupKey, candidates, tokenIndex, out Material bestMaterial, out _, out _);
                 if (bestMaterial != null)
                 {
                     entry.m_TargetMaterial = bestMaterial;
@@ -1667,19 +1947,10 @@ namespace AzumisEditorTools
             string rendererPath = GetRendererPath(renderer.transform, root);
             string relativeRendererPath = GetRendererRelativePath(renderer.transform, root);
             string meshName = string.Empty;
-
-            SkinnedMeshRenderer skinnedMeshRenderer = renderer as SkinnedMeshRenderer;
-            if (skinnedMeshRenderer != null && skinnedMeshRenderer.sharedMesh != null)
+            Mesh sharedMesh = GetRendererSharedMesh(renderer);
+            if (sharedMesh != null)
             {
-                meshName = skinnedMeshRenderer.sharedMesh.name;
-            }
-            else
-            {
-                MeshFilter meshFilter = renderer.GetComponent<MeshFilter>();
-                if (meshFilter != null && meshFilter.sharedMesh != null)
-                {
-                    meshName = meshFilter.sharedMesh.name;
-                }
+                meshName = sharedMesh.name;
             }
 
             PrefabRendererUsageEntry usageEntry = new PrefabRendererUsageEntry();
@@ -1692,6 +1963,18 @@ namespace AzumisEditorTools
 
             usageEntry.m_DisplayLabel = rendererPath + " [Mesh: " + meshName + "] [材质槽 " + materialSlotIndex + "]";
             return usageEntry;
+        }
+
+        private static Mesh GetRendererSharedMesh(Renderer renderer)
+        {
+            SkinnedMeshRenderer skinnedMeshRenderer = renderer as SkinnedMeshRenderer;
+            if (skinnedMeshRenderer != null)
+            {
+                return skinnedMeshRenderer.sharedMesh;
+            }
+
+            MeshFilter meshFilter = renderer != null ? renderer.GetComponent<MeshFilter>() : null;
+            return meshFilter != null ? meshFilter.sharedMesh : null;
         }
 
         private static string GetRendererRelativePath(Transform current, Transform root)
